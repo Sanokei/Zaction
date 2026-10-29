@@ -983,8 +983,14 @@ try {
   await select(maya, actionB, 'proposal');
   await maya.getByTestId('choice-approve').check();
   await maya.getByTestId('submit-vote').click();
+  await eventually(async () => (await local(maya)).pending.some(op => op.type === 'vote' && op.actionId === actionB && op.memberId === mayaId && op.choice === 'approve'), 'second ballot durably saved before intentional reload');
+  await maya.getByTestId('pending-status').waitFor();
+  const savedBallotIntents = (await local(maya)).pending.filter(op => op.type === 'vote');
+  assert.deepEqual(savedBallotIntents.map(op => op.actionId).sort(), [actionA, actionB].sort());
   await maya.reload({ waitUntil: 'domcontentloaded' });
   await eventually(async () => (await local(maya)).pending.filter(op => op.type === 'vote').length === 2, 'two distinct ballot intents retained');
+  const reopenedBallotIntents = (await local(maya)).pending.filter(op => op.type === 'vote');
+  assert.deepEqual(reopenedBallotIntents.map(op => [op.id, op.actionId, op.memberId, op.choice]).sort(), savedBallotIntents.map(op => [op.id, op.actionId, op.memberId, op.choice]).sort(), 'offline reload preserves both original operation IDs, proposal targets, voters and choices');
   assert.equal(target(await snapshot(), actionA).ballots.length, 0);
   assert.equal(target(await snapshot(), actionB).ballots.length, 0);
   for (const id of [actionA, actionB]) {
@@ -1054,6 +1060,7 @@ try {
   const notesB = 'The supper plan was adopted. Confirm access and the estimated budget before making commitments.';
   await maya.getByTestId('minutes-input').fill(notesB);
   await maya.getByTestId('save-minutes-draft').click();
+  await eventually(async () => (await local(maya)).drafts[actionB]?.minutes === notesB, 'second plan minutes durably saved before intentional reload');
   await maya.reload({ waitUntil: 'networkidle' });
   assert.equal(await maya.getByTestId('minutes-input').inputValue(), notesB);
   await maya.getByTestId('publish-minutes').click();
