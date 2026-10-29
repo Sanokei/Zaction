@@ -82,6 +82,8 @@ jobs:
 
           Per-person cost estimates support planning without payments or bookings. Open-Meteo forecast lookup has explicit unavailable, stale, and out-of-range states; weather data is never invented. Live-provider access is separate from controlled integration tests and must be assessed from the actual release evidence.
 
+          Schedule dates include their civil year without viewer-zone shifts; blank time notes say “Time to be agreed,” and raw notes remain unparsed beside a separate city reference zone. Weather is a daily city outlook, not an event-hour or exact-venue prediction. Current city/date/retry scope rejects mismatched or late responses; cached/offline/stale data retains its original check timestamp and uncertainty. Same-city/day cache data may be reused across linked plans without carrying consent or readiness. The existing backend cache/provider/schema are unchanged; ten backend fixtures and earlier provider notices are not new live evidence for this UI work.
+
           Proposal ballots remain separate from reactions and RSVPs. Eligible profiles each have equal voting weight; profile count is not proof of unique people. Personal progress and shared milestones do not increase that weight. Member content and sources remain public and unverified.
 
           Creation and shared submissions can be saved offline and remain pending until server acceptance. Existing room/browser data and legacy fixture history are preserved with additive migration. Private session credentials stay out of public state and release assets. Read the hosting instructions before upgrading or moving an existing room.

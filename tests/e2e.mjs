@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -771,6 +771,218 @@ async function verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext,
   pass('a committed replacement with a lost response replays its original target and ID after worker reload and creates exactly one successor');
 }
 
+async function captureScheduleWeather(page, state, locator) {
+  const previousViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} schedule/weather evidence is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'schedule and forecast context fit the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-schedule-weather-${state}-390x844.png`, fullPage: false });
+  if (previousViewport) await page.setViewportSize(previousViewport);
+}
+
+async function verifyScheduleWeather(otherViewer) {
+  const context = await newContext({ timezoneId: 'Pacific/Kiritimati', locale: 'en-US', viewport: { width: 390, height: 844 } });
+  const checkedAt = new Date(Date.now() - 3600000).toISOString();
+  const nextDate = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
+  const latestDate = new Date(Date.now() + 4 * 86400000).toISOString().slice(0, 10);
+  const requests = [];
+  const available = (query, overrides = {}) => ({ ...query, sourceUrl: 'https://open-meteo.com/', status: 'available', checkedAt,
+    temperatureMaxF: 71, temperatureMinF: 55, rainChance: 12, windMph: 8,
+    description: 'City-day outlook (test forecast)', stale: false, ...overrides });
+  let responseFor = query => available(query);
+  await context.route('**/api/weather?*', async route => {
+    const url = new URL(route.request().url());
+    const query = { cityId: url.searchParams.get('cityId'), date: url.searchParams.get('date') };
+    const entry = { ...query, fulfilled: false };
+    requests.push(entry);
+    const body = await responseFor(query);
+    await route.fulfill({ status: 200, contentType: 'application/json', headers: { 'cache-control': 'no-store' }, body: JSON.stringify(body) });
+    entry.fulfilled = true;
+  });
+  try {
+    const page = await openPage(context);
+    await onboard(page, 'Schedule QA', []);
+    const id = await fillPlan(page, 'walk', 'Community walk · schedule and outlook', '0', ['Water']);
+    await page.getByTestId('plan-time').fill('   ');
+    await page.getByTestId('save-creation').click();
+    await eventually(async () => (await local(page)).creationDraft.planning.timeHint === '   ', 'whitespace time note saved without inventing a clock time');
+    await page.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === id) && !(await local(page)).pending.length, 'schedule example published');
+    await select(page, id);
+    const expectedDate = new Date(`${planDate}T12:00:00Z`).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+    const schedule = page.getByTestId('detail-schedule');
+    assert.equal(await schedule.locator('.schedule-date').innerText(), expectedDate);
+    assert.match(await schedule.innerText(), /Time to be agreed/);
+    assert.match(await schedule.innerText(), /City reference zone: America\/New_York/);
+    await select(otherViewer, id);
+    assert.equal(await otherViewer.getByTestId('detail-schedule').innerText(), await schedule.innerText(), 'UTC+14 and New York viewers see identical civil date/year and scheduling meaning');
+    await navigate(page, 'home');
+    assert.match(await page.getByTestId(`plan-schedule-${id}`).innerText(), /Time to be agreed/);
+    await select(page, id);
+    await captureScheduleWeather(page, 'schedule-fallback', schedule.locator('..'));
+    await page.getByTestId(`plan-update-${id}`).click();
+    const rawNote = '7 pm Pacific (host note; please confirm)';
+    await page.getByTestId('plan-time').fill(rawNote);
+    await page.getByTestId('plan-date').fill(nextDate);
+    await page.getByTestId('plan-city').selectOption('austin');
+    await page.getByTestId('change-reason').fill('Consider another city and day; the host time note stays unparsed until people confirm arrangements.');
+    await page.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(page)).planChangeDrafts[id]?.planning.timeHint === rawNote && (await local(page)).planChangeDrafts[id]?.planning.cityId === 'austin', 'raw time note and revised city saved on their own draft');
+    const oldSchedule = page.getByTestId('comparison-schedule-original');
+    const proposedSchedule = page.getByTestId('comparison-schedule-proposed');
+    assert.match(await oldSchedule.innerText(), /Time to be agreed/);
+    assert.equal(await oldSchedule.locator('.schedule-date').innerText(), expectedDate);
+    assert.equal(await proposedSchedule.locator('.schedule-time').innerText(), rawNote);
+    assert.match(await proposedSchedule.innerText(), /City reference zone: America\/Chicago/);
+    assert.match(await proposedSchedule.innerText(), new RegExp(nextDate.slice(0, 4)));
+    await captureScheduleWeather(page, 'known-raw-note', page.getByTestId('change-comparison'));
+    pass('civil schedules retain year and unset/raw time notes across viewer zones while keeping the city IANA reference separate from arbitrary host text');
+
+    responseFor = query => available(query, { description: 'Austin baseline (test forecast)' });
+    await page.getByTestId('weather-retry').click();
+    await eventually(async () => /Austin baseline/.test(await page.getByTestId('weather-status').innerText()), 'baseline query fixture displayed');
+    await page.evaluate(() => {
+      window.__weatherQueryViolations = [];
+      const panel = document.querySelector('[data-testid="weather-panel"]');
+      const inspect = () => {
+        const text = panel?.textContent ?? '';
+        if (text.includes('Seattle') && text.includes('Austin baseline (test forecast)')) window.__weatherQueryViolations.push('old Austin forecast rendered under Seattle query');
+      };
+      window.__weatherQueryObserver = new MutationObserver(inspect);
+      window.__weatherQueryObserver.observe(panel, { subtree: true, childList: true, characterData: true });
+    });
+    const releaseOldResponses = [];
+    responseFor = query => query.cityId === 'seattle' && query.date === nextDate
+      ? new Promise(resolve => { releaseOldResponses.push(() => resolve(available(query, { description: 'Late older query (test forecast)', temperatureMaxF: 88 }))); })
+      : available(query, { description: 'Seattle current date (test forecast)', temperatureMaxF: 64, rainChance: 32 });
+    await page.getByTestId('plan-city').selectOption('seattle');
+    await eventually(async () => releaseOldResponses.length > 0 && /Seattle/.test(await page.getByTestId('weather-query').innerText()), 'new city query is requested and visible');
+    assert.match(await page.getByTestId('weather-query').innerText(), /America\/Los_Angeles/);
+    assert.match(await page.getByTestId('weather-status').innerText(), /Checking the daily forecast/);
+    assert.equal(await page.locator('.weather-temp').count(), 0, 'changed query immediately hides prior measurements');
+    assert.equal(await page.getByTestId('weather-checked-at').count(), 0);
+    await captureScheduleWeather(page, 'query-loading', page.getByTestId('weather-panel'));
+    await page.getByTestId('plan-date').fill(latestDate);
+    await eventually(async () => /Seattle current date/.test(await page.getByTestId('weather-status').innerText()), 'newer city/date response wins');
+    for (const releaseOldResponse of releaseOldResponses) releaseOldResponse();
+    await eventually(async () => requests.filter(request => request.cityId === 'seattle' && request.date === nextDate).every(request => request.fulfilled), 'older deferred responses have actually arrived');
+    assert.match(await page.getByTestId('weather-status').innerText(), /Seattle current date/);
+    assert.doesNotMatch(await page.getByTestId('weather-status').innerText(), /Late older query|88°/);
+    assert.deepEqual(await page.evaluate(() => { window.__weatherQueryObserver.disconnect(); return window.__weatherQueryViolations; }), [], 'no transient old forecast was displayed beneath the changed city');
+    const beforeEmptyDate = requests.length;
+    await page.getByTestId('plan-date').fill('');
+    await eventually(async () => /Pick a date and a city/.test(await page.getByTestId('weather-status').innerText()), 'clearing date shows an explicit unset query');
+    assert.equal(await page.locator('.weather-temp').count(), 0);
+    assert.equal(await page.getByTestId('weather-retry').isDisabled(), true);
+    assert.equal(requests.length, beforeEmptyDate, 'empty dates do not issue a weather request');
+    pass('city/date changes show loading without old metrics, ignore late prior responses, and clearing the date issues no forecast request');
+
+    const invalidResponses = [
+      query => available(query, { cityId: 'new-york', description: 'Wrong-city available payload (test fixture)' }),
+      query => available(query, { date: nextDate, description: 'Wrong-date available payload (test fixture)' }),
+      query => ({ ...query, cityId: 'new-york', sourceUrl: 'https://open-meteo.com/', status: 'unavailable', reason: 'Wrong-city unavailable reason (test fixture)' }),
+      query => ({ ...query, date: nextDate, sourceUrl: 'https://open-meteo.com/', status: 'unavailable', reason: 'Wrong-date unavailable reason (test fixture)' }),
+      query => available(query, { checkedAt: 'not-a-retrieval-timestamp' }),
+      query => available(query, { stale: 'yes' }),
+    ];
+    for (let index = 0; index < invalidResponses.length; index++) {
+      responseFor = invalidResponses[index];
+      const before = requests.length;
+      if (index === 0) await page.getByTestId('plan-date').fill(latestDate);
+      else await page.getByTestId('weather-retry').click();
+      await eventually(async () => requests.length > before && /could not be verified for this city and date/.test(await page.getByTestId('weather-status').innerText()), `invalid query/metadata fixture ${index + 1} rejected`);
+      assert.match(await page.getByTestId('weather-query').innerText(), /Seattle/);
+      assert.doesNotMatch(await page.getByTestId('weather-status').innerText(), /Wrong-city|Wrong-date/);
+      assert.equal(await page.locator('.weather-temp').count(), 0);
+      assert.equal(await page.getByTestId('weather-checked-at').count(), 0, 'invalid retrieval metadata is never displayed');
+    }
+    await captureScheduleWeather(page, 'unavailable', page.getByTestId('weather-panel'));
+    responseFor = query => available(query, { stale: true, reason: 'Controlled test refresh failure; this is only the same-query cached outlook.', description: 'Cached same-query outlook (test forecast)', temperatureMaxF: 64, rainChance: 32 });
+    await page.getByTestId('weather-retry').click();
+    await eventually(async () => /Cached forecast.*May be stale/s.test(await page.getByTestId('weather-status').innerText()), 'matching stale response explicitly warns about cache age');
+    assert.equal(await page.getByTestId('weather-checked-at').getAttribute('datetime'), checkedAt);
+    assert.match(await page.getByTestId('weather-advice').innerText(), /cached daily outlook may be stale/i);
+    assert.doesNotMatch(await page.getByTestId('weather-advice').innerText(), /Looks worth considering/);
+    assert.match(await page.getByTestId('weather-precipitation').innerText(), /Daily max precipitation chance/);
+    await captureScheduleWeather(page, 'stale', page.getByTestId('weather-panel'));
+    await page.getByTestId('weather-retry').click();
+    await eventually(async () => /Cached same-query outlook/.test(await page.getByTestId('weather-status').innerText()) && !await page.getByTestId('weather-retry').isDisabled(), 'retry settles with the original matching cache timestamp');
+    assert.deepEqual({ cityId: requests.at(-1).cityId, date: requests.at(-1).date }, { cityId: 'seattle', date: latestDate });
+    assert.equal(await page.getByTestId('weather-checked-at').getAttribute('datetime'), checkedAt);
+    pass('available and unavailable response identities and displayed metadata are validated; matching stale retries retain their original timestamp and uncertainty');
+
+    responseFor = query => available(query, { description: 'Current query before offline (test forecast)', temperatureMaxF: 64 });
+    await page.getByTestId('weather-retry').click();
+    await eventually(async () => /Current query before offline/.test(await page.getByTestId('weather-status').innerText()), 'matching outlook loaded before going offline');
+    await context.setOffline(true);
+    await eventually(async () => /Cached forecast.*Offline/s.test(await page.getByTestId('weather-status').innerText()), 'in-place offline outlook is honestly cached');
+    assert.equal(await page.getByTestId('weather-checked-at').getAttribute('datetime'), checkedAt);
+    assert.match(await page.getByTestId('weather-advice').innerText(), /offline.*cached daily outlook may have changed/is);
+    assert.doesNotMatch(await page.getByTestId('weather-advice').innerText(), /Looks worth considering/);
+    await captureScheduleWeather(page, 'offline', page.getByTestId('weather-panel'));
+    const beforeOfflineQuery = requests.length;
+    await page.getByTestId('plan-city').selectOption('austin');
+    await eventually(async () => /Austin/.test(await page.getByTestId('weather-query').innerText()) && /No forecast for this city and date/.test(await page.getByTestId('weather-status').innerText()), 'offline changed query has no matching forecast');
+    assert.equal(await page.locator('.weather-temp').count(), 0);
+    assert.equal(await page.getByTestId('weather-checked-at').count(), 0);
+    assert.equal(requests.length, beforeOfflineQuery, 'offline query changes do not request or reuse another city outlook');
+    await page.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(page)).planChangeDrafts[id]?.planning.cityId === 'austin' && (await local(page)).planChangeDrafts[id]?.planning.date === latestDate, 'current query terms durably saved before offline reload');
+    const offlineReload = await page.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(offlineReload.fromServiceWorker());
+    await eventually(async () => /No forecast for this city and date/.test(await page.getByTestId('weather-status').innerText()), 'offline worker reload has no persistent forecast');
+    assert.equal(await page.getByTestId('weather-checked-at').count(), 0);
+    assert.equal(await page.locator('.weather-temp').count(), 0);
+    assert.equal(JSON.stringify(await local(page)).includes('Current query before offline (test forecast)'), false, 'weather results are absent from durable browser state');
+    responseFor = query => available(query, { description: 'Reconnected Austin outlook (test forecast)', temperatureMaxF: 68 });
+    await context.setOffline(false);
+    await foreground(page);
+    await eventually(async () => /Reconnected Austin outlook/.test(await page.getByTestId('weather-status').innerText()), 'reconnect checks the current saved city/date');
+    assert.deepEqual({ cityId: requests.at(-1).cityId, date: requests.at(-1).date }, { cityId: 'austin', date: latestDate });
+    pass('offline in-place weather keeps only matching cached context and original retrieval time; reload invents no persistent outlook and reconnect checks current terms');
+
+    await page.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(page)).planChangeDrafts[id]?.planning.cityId === 'austin' && (await local(page)).planChangeDrafts[id]?.planning.date === latestDate, 'replacement terms saved for the changed query');
+    const successorId = (await local(page)).planChangeDrafts[id].id;
+    await page.getByTestId('publish-plan-change').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === successorId) && !(await local(page)).pending.length, 'different-query linked replacement accepted');
+    await page.getByTestId('open-created-action').click();
+    await eventually(async () => (await local(page)).selectedActionId === successorId && /Reconnected Austin outlook/.test(await page.getByTestId('weather-status').innerText()), 'successor shows only its own city/date outlook');
+    const successorSchedule = page.getByTestId('detail-schedule');
+    assert.equal(await successorSchedule.locator('.schedule-time').innerText(), rawNote, 'the copied arbitrary time note is not converted when city/date change');
+    assert.match(await successorSchedule.innerText(), /City reference zone: America\/Chicago/);
+    assert.match(await page.getByTestId('weather-query').innerText(), /Austin/);
+    assert.match(await page.getByTestId('weather-query').innerText(), /America\/Chicago/);
+    assert.equal(await page.getByTestId('weather-checked-at').getAttribute('datetime'), checkedAt);
+    assert.doesNotMatch(await page.getByTestId('weather-status').innerText(), /Seattle current date|Austin baseline/);
+    await captureScheduleWeather(page, 'replacement', page.getByTestId('weather-panel'));
+    await page.setViewportSize({ width: 1440, height: 1100 });
+    await eventually(async () => /Reconnected Austin outlook/.test(await page.getByTestId('weather-status').innerText()), 'desktop weather panel settles for the same query');
+    await page.getByTestId('weather-panel').evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: '/tmp/zaction-schedule-weather-replacement-desktop.png', fullPage: false });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.getByTestId(`plan-update-${successorId}`).click();
+    await page.getByTestId('create-title').fill('Community walk · same-day accessibility notes');
+    await page.getByTestId('change-reason').fill('Clarify the welcome notes without changing this city or civil date; the daily outlook remains only planning context.');
+    await page.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(page)).planChangeDrafts[successorId]?.title === 'Community walk · same-day accessibility notes', 'same-query successor draft saved');
+    const sameQueryId = (await local(page)).planChangeDrafts[successorId].id;
+    await page.getByTestId('publish-plan-change').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === sameQueryId) && !(await local(page)).pending.length, 'same-query linked replacement accepted');
+    await page.getByTestId('open-created-action').click();
+    await eventually(async () => (await local(page)).selectedActionId === sameQueryId && /Reconnected Austin outlook/.test(await page.getByTestId('weather-status').innerText()), 'same city/day controlled response remains valid on a linked plan');
+    assert.equal(await page.getByTestId('weather-checked-at').getAttribute('datetime'), checkedAt, 'same-query reuse does not invent a new retrieval timestamp or event readiness');
+    assert.equal(target(await snapshot(), successorId).origin.actionId, id);
+    assert.equal(target(await snapshot(), sameQueryId).origin.actionId, successorId);
+    assert.equal(await page.getByTestId('detail-schedule').locator('.schedule-time').innerText(), rawNote);
+    pass('linked replacements use their own schedule/query while honest same-city/day responses retain the original retrieval stamp and raw host note');
+  } finally { await context.close(); }
+}
+
 try {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(`Server exited: ${output}`);
@@ -1160,6 +1372,7 @@ try {
 
   await verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, noahId);
   await verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext, noahId);
+  await verifyScheduleWeather(maya);
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept
@@ -1175,9 +1388,10 @@ try {
     });
     await fillPlan(observedPage, 'bbq', 'Weather observation draft', '0');
     await eventually(async () => ['available', 'unavailable'].includes(observed?.status), 'unmocked weather route observation', 20000);
-    await eventually(async () => !/Checking the forecast/.test(await observedPage.getByTestId('weather-status').innerText()), 'observed weather rendered');
+    await eventually(async () => /Forecast available|Cached forecast|Forecast unavailable/.test(await observedPage.getByTestId('weather-status').innerText()), 'observed weather rendered');
     await capture(observedPage, 'weather-observed', observedPage.getByTestId('weather-panel'));
-    console.log(`OBSERVED: unmocked weather route returned ${observed.status}; screenshot /tmp/zaction-social-weather-observed-390x844.png. This observation is separate from fixture PASS counts.`);
+    await writeFile('/tmp/zaction-weather-observed.json', `${JSON.stringify({ observedAt: new Date().toISOString(), response: observed }, null, 2)}\n`);
+    console.log(`OBSERVED: unmocked weather route returned ${observed.status} for ${observed.cityId}/${observed.date}${observed.checkedAt ? `; original checkedAt ${observed.checkedAt}` : '; no forecast retrieval timestamp returned'}; public response /tmp/zaction-weather-observed.json; screenshot /tmp/zaction-social-weather-observed-390x844.png. This observation is separate from fixture PASS counts.`);
     await observedContext.close();
   }
 

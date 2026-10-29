@@ -249,12 +249,23 @@ const actions: Actions = {
     await mutate(previous => ({ ...previous, replyTargets: { ...previous.replyTargets, [actionId]: parentId } }));
   },
   async getWeather(cityId, date) {
+    const context = { cityId, date, sourceUrl: 'https://open-meteo.com/' };
     try {
       const result = await request(`/api/weather?cityId=${encodeURIComponent(cityId)}&date=${encodeURIComponent(date)}`);
-      if (result?.status === 'available' && [result.temperatureMaxF, result.temperatureMinF, result.rainChance, result.windMph].every(Number.isFinite) && typeof result.checkedAt === 'string') return result;
-      if (result?.status === 'unavailable' && typeof result.reason === 'string') return result;
+      if (!result || result.cityId !== cityId || result.date !== date || result.sourceUrl !== context.sourceUrl) throw new Error('The forecast did not match this city and date.');
+      if (result.status === 'available' &&
+          [result.temperatureMaxF, result.temperatureMinF, result.rainChance, result.windMph].every(value => typeof value === 'number' && Number.isFinite(value)) &&
+          result.temperatureMinF <= result.temperatureMaxF && result.rainChance >= 0 && result.rainChance <= 100 && result.windMph >= 0 &&
+          typeof result.checkedAt === 'string' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(result.checkedAt) && Number.isFinite(Date.parse(result.checkedAt)) &&
+          typeof result.description === 'string' && Boolean(result.description.trim()) && typeof result.stale === 'boolean' &&
+          (result.reason === undefined || typeof result.reason === 'string')) {
+        return { ...context, status: 'available', checkedAt: result.checkedAt, temperatureMaxF: result.temperatureMaxF, temperatureMinF: result.temperatureMinF,
+          rainChance: result.rainChance, windMph: result.windMph, description: result.description, stale: result.stale,
+          ...(result.reason !== undefined ? { reason: result.reason } : {}) };
+      }
+      if (result.status === 'unavailable' && typeof result.reason === 'string' && result.reason.trim()) return { ...context, status: 'unavailable', reason: result.reason };
       throw new Error('Unsupported forecast response.');
-    } catch { return { status: 'unavailable', cityId, date, sourceUrl: 'https://open-meteo.com/', reason: 'The forecast could not be loaded. Try again, or include a rain backup while making your plan.' }; }
+    } catch { return { ...context, status: 'unavailable', reason: 'A forecast could not be verified for this city and date. Try again, or include a rain backup while making your plan.' }; }
   },
   async saveDraft(actionId, text, field = 'discussion') {
     if (!validActionId(actionId)) return false;

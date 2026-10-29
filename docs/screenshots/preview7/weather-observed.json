@@ -1,0 +1,10 @@
+{
+  "observedAt": "2026-10-29T22:02:16.933Z",
+  "response": {
+    "status": "unavailable",
+    "cityId": "new-york",
+    "date": "2026-10-31",
+    "sourceUrl": "https://open-meteo.com/",
+    "reason": "The weather provider could not be reached. Try again later."
+  }
+}
