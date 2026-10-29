@@ -1,0 +1,52 @@
+# Plan changes and author withdrawal
+
+Bounded plan prepared October 29, 2026 (America/New_York), before app edits. Starting source: `3501ce55e9f5f9bb0fed898c27a8ab94511efcfa`, immutable public `v0.1.0-preview.4`. Inspection found creation, comments, votes, RSVPs and bring-item offers, but no author change/cancel operations or controls. No applicable AGENTS.md was found. [Spec.pdf](https://github.com/Sanokei/Zaction/blob/262a06b2e67ca676d30c8f11d92d6fb4a902ac88/Spec.pdf) remains SHA-256 `243bb265e8a5aa80621070a73f858b375149cebdbcbeccf3500a4d12576baa3f`.
+
+## Research and critique
+
+The actual PDF requires human-approved event plans (§3.3), proposal terms and published voting rules (§3.5), preserved decisions/minutes and visible changes (§3.6), honest logistics/confirmation (§3.7), and queued offline work with freshness cues (§4.5). Phase 1 includes events and proposals without money (§9). Author control over a preview listing is not authority to rewrite an adopted group decision. Preserve its outcome and records independently from gathering status. Existing demo ownership is a pseudonymous session/profile check, not production membership or group governance.
+
+Primary sources read October 29, 2026:
+
+- [pretix event cloning](https://github.com/pretix/pretix/blob/e6f8f178aff537bc32dc7359a5f561b8074a269b/doc/api/resources/events.rst#L324-L333) creates a new event with explicitly copied configuration. Its [deletion restriction](https://github.com/pretix/pretix/blob/e6f8f178aff537bc32dc7359a5f561b8074a269b/doc/api/resources/events.rst#L499-L501) preserves events containing orders. pretix also [supports in-place changes](https://github.com/pretix/pretix/blob/e6f8f178aff537bc32dc7359a5f561b8074a269b/doc/api/resources/events.rst#L424-L426); immutable replacement is Zaction's consent choice, not a universal product rule.
+- [W3C modal-dialog pattern](https://github.com/w3c/aria-practices/blob/0f765e4dc33e966026114ac12a8380db1de3b787/content/patterns/dialog-modal/dialog-modal-pattern.html): focus inside, contained Tab/Shift+Tab, Escape to close, restore focus; initially focus the least destructive cancellation choice.
+- [W3C status messages](https://github.com/w3c/wcag/blob/870593bbcd510c09797bf08844ebefc4880360d0/understanding/21/status-messages.html): expose waiting/success/error status without taking focus. This repository source is a draft; no published criterion number is inferred.
+
+Official Eventbrite and Partiful help reads were attempted but blocked by proxy CONNECT 403; no interaction claims rely on them. Existing static plan terms have no visible way to explain changed weather/date/budget, and editing them in place would hide what participants agreed to. Add coordination and recovery before additional templates.
+
+## Bounded behavior and protocol
+
+1. **Author prepares a replacement.** Copy only editable plan fields into a separate durable, per-source change draft. Keep unrelated creation/discussion/minutes drafts. A required short change reason and the old/new date, budget, and location are reviewed before sharing. Until acceptance, original public terms stay active.
+2. **Atomic linked replacement.** A `change-plan` operation targets the original action and names a fresh `replacementActionId`, full validated `action`, `changeReason`, and `expectedChangeId`. The server checks the original author and exact lifecycle token, then creates a fresh action and links both records atomically. The original becomes superseded. New ballots, RSVPs, reactions, claims, discussion, minutes, tasks and local progress start empty; no pending actions or private saves are retargeted.
+3. **Separate listing status.** Add optional schema-2 `lifecycle`: `{status:'active'|'superseded'|'cancelled',changeId,changedAt,changedBy,reason,replacementActionId?}`. An active default has null token/time/actor and empty reason. Terminal states use the accepted transition operation ID, timestamp, author and reason. Add successor `origin:{actionId,reason,kind:'change'|'restart'}`. Validate bidirectional links, known authors/IDs, and acyclic chains. Only absent legacy lifecycle metadata defaults active; malformed existing data is preserved and rejected.
+4. **Author withdrawal.** `cancel-plan` requires the author, `expectedChangeId`, and reason. Confirm “Cancel this gathering,” initially focused on “Keep plan.” Explain that it changes the Zaction listing and does not notify people or cancel outside arrangements automatically. It retains the plan and prior group outcome. Never manufacture a cancellation vote or erase adopted minutes.
+5. **Plan again.** A cancelled original ID stays cancelled. Explicitly prepare a new linked proposal with fresh participation and the cancellation token. Each old plan has at most one successor. Keep the original cancellation reason/status; link the separate successor. A stale earlier edit must be explicitly reviewed against current state before a new attempt; never automatically rebase or publish it.
+6. **Offline and race safety.** Store original targets/tokens/reasons in durable queues. Atomically deduplicate author transitions per source plan locally. Server serialization and exact tokens decide cancel-versus-change races; replay returns its original receipt and current snapshot. A lost response cannot create a second successor. Terminal plans reject new participation against their original IDs with a concrete reason; never redirect to the successor. Exact-owner/exact-claim-ID releases remain allowed only on the original plan. Expiry skips inactive listings so it does not invent a later outcome.
+
+`lifecycle` does not replace `outcome`; an adopted proposal can have a later cancelled listing. Existing accepted votes and commitments are explicitly historical on inactive plans. Synthetic examples without an author have no author controls. No new authentication, notifications, external messages, payments, location collection, agent/model, or environment publication is introduced.
+
+## Interaction states and acceptance
+
+| State | Required experience |
+|---|---|
+| Active / browsing | Current terms; author-only management; all participants retain equal voting weight |
+| Change draft | Clear original-plan target, private save, meaningful reason and terms comparison; unrelated drafts preserved |
+| Offline / pending | “Saved here—awaiting acceptance”; original public state unchanged; reopen retains exact draft/queue targets |
+| Superseded | Visible reason/time, original terms and participation labelled historical, explicit link to fresh proposal |
+| Cancelled | Author-withdrawal banner, preserved original group result/history, no new participation; exact-owner release still available |
+| Plan again | Explicit fresh-plan consent; old cancelled ID never reactivated |
+| Stale / unauthorized / unavailable | Concrete rejection, original submission/draft retained, refresh and deliberate review/new attempt; no automatic target changes |
+| Reload / saved link | Same historical plan remains accessible, with its current status and successor navigation |
+| Keyboard / narrow | Accessible cancellation confirmation, stable focus/status, readable wrapped reason/terms at 390×844 |
+
+Verify two independent plans and participants; author/non-author requests; cancel/change races; invalid replacement/persistence atomicity; lost response with stable-ID retry; old queued ballot/RSVP/claim and exact release after transition; cancellation plus reopen/plan again; preserved adopted outcome and expiry; legacy/corrupt migration; private draft preservation and stale review. Inspect original desktop and 390×844 change/pending/superseded/cancelled/rejected/recovery captures. Run current Node/build/browser checks and the extracted ZIP before publishing a new immutable preview. Public workflow/assets/checksum/source verification follows publication; previous releases and environment review remain separate.
+
+## Implemented and locally verified
+
+Preview.5 implements the bounded protocol, author controls, separate per-source change drafts, original/proposed terms review, visible withdrawal and successor links. Normal creation drafts and old participation remain intact. A stale draft can explicitly review a refreshed lifecycle token while keeping its entered fields and candidate ID; it cannot be silently redirected to a successor. Inactive open votes are labelled “No final decision” rather than showing an active ballot form. Existing adopted/rejected/no-quorum decisions stay recorded.
+
+Actual results: **151 Node checks** (129 domain, 12 authenticated HTTP, 10 weather fixtures), TypeScript/Vite/service-worker production build, and **26 browser flows** passed on the final frozen assets. The seven added flows cover author-only changes and private draft isolation; offline adopted-plan replacement with fresh participation; guarded keyboard cancellation and offline reload; three stale original-target participation intents plus exact original release/new-claim isolation; cancelled-plan restart under a new ID; stale author review/recovery; and real server commit/lost-response replay producing one successor. Node tests also prove cancel/change race orders, failed persistence atomicity, skipped inactive expiry, migration defaults, malformed links/cycles/authors/reasons and original-file preservation.
+
+Source and visual review found and corrected two cancellation issues before final verification: inactive/open vote copy suggested a live decision, and closing a confirmation during local persistence could imply aborting an operation still being queued. The final confirmation guards dismissal while saving and restores focus to a stable management heading after queue/acceptance. Its regression delays only the real transaction's completion notification; data writes remain real. Partial pre-fix browser runs are not counted as complete evidence.
+
+The [ten original viewport captures](screenshots/preview5/README.md) were inspected at 390×844 and 1440×1100. The changed date/estimate/location comparison, named targets, reasons, accepted history, pending/rejected status, and recovery controls are readable with no horizontal overflow. These are desktop Chromium viewport checks, not actual-handset evidence. The version/tag and downloadable `RELEASE.json` record the final source; extracted ZIP and public release verification occur after committing, independently of these local results. Earlier releases and the unchanged Spec/source baseline remain intact.

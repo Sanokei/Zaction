@@ -7,7 +7,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ACTION_ID = 'reading-circle';
 const MEMBERS = new Set(['alex', 'river', 'jules']);
-const TYPES = new Set(['create-action', 'contribute', 'vote', 'close', 'minutes', 'complete-task', 'react', 'rsvp', 'bring-item']);
+const TYPES = new Set(['create-action', 'contribute', 'vote', 'close', 'minutes', 'complete-task', 'react', 'rsvp', 'bring-item', 'change-plan', 'cancel-plan']);
 const TASKS = new Set(['accessibility', 'agenda', 'minutes']);
 const CITIES = new Set(['new-york', 'austin', 'seattle', 'chicago', 'los-angeles']);
 const PLAN_KINDS = new Set(['bbq', 'potluck', 'games', 'walk', 'help', 'idea']);
@@ -23,6 +23,8 @@ const actionId = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.
 const sortObject = value => Array.isArray(value) ? value.map(sortObject) : object(value) ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sortObject(value[key])])) : value;
 const canonical = value => JSON.stringify(sortObject(value));
 const tokenDigest = token => createHash('sha256').update(token).digest('hex');
+const activeLifecycle = () => ({ status: 'active', changeId: null, changedAt: null, changedBy: null, reason: '' });
+const validChangeReason = reason => typeof reason === 'string' && reason.length <= 600 && reason.trim().length >= 5;
 const profilesAt = now => [
   { id: 'alex', name: 'Alex', color: '#7654cb' },
   { id: 'river', name: 'River', color: '#34755b' },
@@ -34,7 +36,7 @@ function createActionRecord(id, input, memberId, now, sourceKind = 'member-provi
     ...input, id, createdBy: memberId, createdAt: timestamp(now), sourceKind,
     proposalRevision: 1, rulesVersion: 'DEMO-RULES-v1', membershipVersion: sourceKind === 'synthetic' ? 'DEMO-MEMBERS-v1' : 'COMMUNITY-PREVIEW-v1',
     closesAt: timestamp(Number(new Date(now)) + 7 * 24 * 60 * 60 * 1000),
-    contributions: [], ballots: [], outcome: 'open', closedAt: null, minutes: [], completedTasks: [], reactions: [], rsvps: [], bringClaims: [],
+    contributions: [], ballots: [], outcome: 'open', closedAt: null, minutes: [], completedTasks: [], reactions: [], rsvps: [], bringClaims: [], lifecycle: activeLifecycle(),
   };
 }
 
@@ -86,6 +88,49 @@ function validActionRecords(action, memberIds) {
       typeof action.planning.bring[claim.itemIndex] === 'string' && action.planning.bring[claim.itemIndex].trim().length > 0) ||
       new Set(action.bringClaims.map(claim => claim.itemIndex)).size !== action.bringClaims.length ||
       new Set(action.bringClaims.map(claim => claim.id)).size !== action.bringClaims.length) return false;
+  const lifecycle = action.lifecycle;
+  if (!object(lifecycle) || !['active', 'superseded', 'cancelled'].includes(lifecycle.status)) return false;
+  if (lifecycle.status === 'active') {
+    if (lifecycle.changeId !== null || lifecycle.changedAt !== null || lifecycle.changedBy !== null || lifecycle.reason !== '' || Object.hasOwn(lifecycle, 'replacementActionId')) return false;
+  } else {
+    if (!operationId(lifecycle.changeId) || typeof lifecycle.changedAt !== 'string' || !Number.isFinite(Date.parse(lifecycle.changedAt)) ||
+        !memberIds.has(lifecycle.changedBy) || lifecycle.changedBy !== action.createdBy || action.sourceKind !== 'member-provided' || !validChangeReason(lifecycle.reason)) return false;
+    if (lifecycle.status === 'superseded' && !Object.hasOwn(lifecycle, 'replacementActionId')) return false;
+    if (Object.hasOwn(lifecycle, 'replacementActionId') && (!actionId(lifecycle.replacementActionId) || lifecycle.replacementActionId === action.id)) return false;
+  }
+  if (Object.hasOwn(action, 'origin') && (!object(action.origin) || !actionId(action.origin.actionId) || action.origin.actionId === action.id || !['change', 'restart'].includes(action.origin.kind) || !validChangeReason(action.origin.reason))) return false;
+  return true;
+}
+
+function validLifecycleLinks(actions) {
+  const byId = new Map(actions.map(action => [action.id, action]));
+  for (const action of actions) {
+    const replacementId = action.lifecycle.replacementActionId;
+    if (replacementId !== undefined) {
+      const replacement = byId.get(replacementId);
+      const expectedKind = action.lifecycle.status === 'superseded' ? 'change' : 'restart';
+      if (!replacement || replacement.origin?.actionId !== action.id || replacement.origin.kind !== expectedKind ||
+          replacement.createdBy !== action.createdBy || replacement.sourceKind !== 'member-provided' ||
+          (expectedKind === 'change' && replacement.origin.reason !== action.lifecycle.reason)) return false;
+    }
+    if (action.origin) {
+      const source = byId.get(action.origin.actionId);
+      if (!source || source.lifecycle.replacementActionId !== action.id || source.createdBy !== action.createdBy ||
+          action.createdBy === null || source.sourceKind !== 'member-provided' || action.sourceKind !== 'member-provided' ||
+          source.lifecycle.status !== (action.origin.kind === 'change' ? 'superseded' : 'cancelled')) return false;
+    }
+  }
+  const checked = new Set();
+  for (const start of actions) {
+    const chain = new Set();
+    let current = start;
+    while (current && !checked.has(current.id)) {
+      if (chain.has(current.id)) return false;
+      chain.add(current.id);
+      current = byId.get(current.lifecycle.replacementActionId);
+    }
+    for (const id of chain) checked.add(id);
+  }
   return true;
 }
 
@@ -96,7 +141,7 @@ function assertDemoData(data) {
   const memberIds = new Set(validProfiles ? profiles.map(profile => profile.id) : []);
   if (!object(data) || !object(snapshot) || snapshot.schemaVersion !== 2 || typeof snapshot.roomId !== 'string' || !snapshot.roomId ||
       !Number.isSafeInteger(snapshot.sequence) || snapshot.sequence < 0 || !Array.isArray(snapshot.actions) ||
-      !validProfiles || !snapshot.actions.every(action => validActionRecords(action, memberIds)) || new Set(snapshot.actions.map(action => action.id)).size !== snapshot.actions.length ||
+      !validProfiles || !snapshot.actions.every(action => validActionRecords(action, memberIds)) || new Set(snapshot.actions.map(action => action.id)).size !== snapshot.actions.length || !validLifecycleLinks(snapshot.actions) ||
       !object(data.sessions) || !Object.entries(data.sessions).every(([digest, memberId]) => /^[0-9a-f]{64}$/.test(digest) && memberIds.has(memberId) && !MEMBERS.has(memberId)) ||
       !object(data.receipts) || !Object.values(data.receipts).every(record => object(record) && object(record.operation) && object(record.receipt) &&
         typeof record.receipt.id === 'string' && typeof record.receipt.actionId === 'string' && typeof record.receipt.accepted === 'boolean' &&
@@ -143,6 +188,7 @@ export function migrateDemoData(input) {
         if (action.reactions === undefined) { action.reactions = []; enriched = true; }
         if (action.rsvps === undefined) { action.rsvps = []; enriched = true; }
         if (!Object.hasOwn(action, 'bringClaims')) { action.bringClaims = []; enriched = true; }
+        if (!Object.hasOwn(action, 'lifecycle')) { action.lifecycle = activeLifecycle(); enriched = true; }
       }
     }
     if (data.sessions === undefined) data.sessions = {};
@@ -162,7 +208,7 @@ function closeAction(action, now) {
 
 function finalizeExpired(snapshot, now) {
   for (const action of snapshot.actions) {
-    if (action.outcome === 'open' && Number(new Date(now)) >= Date.parse(action.closesAt)) {
+    if (action.lifecycle.status === 'active' && action.outcome === 'open' && Number(new Date(now)) >= Date.parse(action.closesAt)) {
       closeAction(action, now);
       snapshot.sequence += 1;
     }
@@ -248,54 +294,80 @@ export function applyOperation(input, operation, now = Date.now()) {
     const action = snapshot.actions.find(item => item.id === op.actionId);
     if (!action) return reject('This action is not available. Your saved action was not applied to a different action.');
     if (op.proposalRevision !== action.proposalRevision || op.rulesVersion !== action.rulesVersion || op.membershipVersion !== action.membershipVersion) return reject('The proposal rules or eligibility snapshot has changed. Review this action before submitting.');
-    if (action.membershipVersion === 'DEMO-MEMBERS-v1' && !MEMBERS.has(op.memberId) && ['vote', 'close', 'minutes', 'complete-task'].includes(op.type)) return reject('This legacy example vote is limited to its three synthetic demo members. Join a community-created action to take part with your own profile.');
-    if (['contribute', 'minutes'].includes(op.type) && (typeof op.text !== 'string' || !op.text.trim() || op.text.length > 2000)) return reject('Enter between 1 and 2,000 characters.');
-    if (op.type === 'vote') {
-      if (!['approve', 'oppose', 'abstain'].includes(op.choice)) return reject('Choose approve, oppose, or abstain.');
-      if (action.outcome !== 'open') return reject('This vote is closed. Your saved ballot was not accepted before the closing deadline.');
-      if (action.ballots.some(ballot => ballot.memberId === op.memberId)) return reject('This demo member already has an accepted final ballot for this action. A second device does not add a vote.');
-      action.ballots.push({ id: op.id, memberId: op.memberId, choice: op.choice, createdAt: receipt.receivedAt });
-    } else if (op.type === 'contribute') {
-      if (op.parentId !== undefined && op.replyTo !== undefined && op.parentId !== op.replyTo) return reject('A reply must name one parent comment.');
-      const parentId = op.parentId ?? op.replyTo;
-      if (parentId !== undefined && (typeof parentId !== 'string' || !action.contributions.some(parent => parent.id === parentId))) return reject('Reply to a comment on this action. A comment from another action cannot be used as the parent.');
-      action.contributions.push({ id: op.id, memberId: op.memberId, text: op.text.trim(), createdAt: receipt.receivedAt, ...(parentId !== undefined ? { parentId } : {}) });
-    } else if (op.type === 'close') {
-      if (action.outcome !== 'open') return reject('This demo vote has already closed.');
-      closeAction(action, now);
-    } else if (op.type === 'minutes') {
-      if (action.outcome === 'open') return reject('Close the demo vote before publishing its decision notes.');
-      action.minutes.push({ id: op.id, memberId: op.memberId, text: op.text.trim(), createdAt: receipt.receivedAt });
-    } else if (op.type === 'complete-task') {
-      if (action.outcome !== 'adopted') return reject('Next-action completion is available after a plan is adopted.');
-      if (!TASKS.has(op.taskId)) return reject('This task does not belong to this action’s plan.');
-      if (action.completedTasks.some(task => task.id === op.taskId)) return reject('This task is already marked complete. It is counted once for this action.');
-      action.completedTasks.push({ id: op.taskId, memberId: op.memberId, createdAt: receipt.receivedAt });
-    } else if (op.type === 'react') {
-      if (typeof op.active !== 'boolean') return reject('Choose whether this reaction is active.');
-      const existing = action.reactions.find(record => record.memberId === op.memberId);
-      if (op.active && !existing) action.reactions.push({ memberId: op.memberId, createdAt: receipt.receivedAt });
-      if (!op.active) action.reactions = action.reactions.filter(record => record.memberId !== op.memberId);
-    } else if (op.type === 'rsvp') {
-      if (!action.planning || action.planning.kind === 'idea') return reject('RSVPs are available for plans with gathering details.');
-      if (!['going', 'maybe', 'none'].includes(op.status)) return reject('Choose going, maybe, or no RSVP.');
-      action.rsvps = action.rsvps.filter(record => record.memberId !== op.memberId);
-      if (op.status !== 'none') action.rsvps.push({ memberId: op.memberId, status: op.status, createdAt: receipt.receivedAt });
-    } else if (op.type === 'bring-item') {
-      const slots = action.planning?.bring?.length ?? 0;
-      if (!Number.isSafeInteger(op.itemIndex) || op.itemIndex < 0 || op.itemIndex >= slots) return reject('Choose a listed bring item by its valid item index. No item was changed.');
-      if (!['claim', 'release'].includes(op.intent)) return reject('Choose whether to offer or release this bring item.');
-      const current = action.bringClaims.find(claim => claim.itemIndex === op.itemIndex);
-      if (op.intent === 'claim') {
-        if (op.claimId !== undefined) return reject('A new offer must not include a previous claim ID. Review this item and offer again.');
-        if (current) return reject('This item already has an accepted offer. Review its current owner before trying another available item.');
-        action.bringClaims.push({ id: op.id, itemIndex: op.itemIndex, memberId: op.memberId, createdAt: receipt.receivedAt });
+    if (['change-plan', 'cancel-plan'].includes(op.type)) {
+      if (action.sourceKind !== 'member-provided' || action.createdBy === null || action.createdBy !== op.memberId) return reject('Only this plan’s author can change or cancel its listing. Synthetic examples without an author cannot be managed.');
+      if (!Object.hasOwn(op, 'expectedChangeId') || !(op.expectedChangeId === null || operationId(op.expectedChangeId)) || op.expectedChangeId !== action.lifecycle.changeId) return reject('This plan’s status has changed since your draft was prepared. Review its current status before making a new request.');
+      if (!validChangeReason(op.changeReason)) return reject('Explain the change in 5–600 characters.');
+      const reason = op.changeReason.trim();
+      if (op.type === 'cancel-plan') {
+        if (action.lifecycle.status !== 'active') return reject('This listing is already inactive. Its existing status and history were not changed.');
+        action.lifecycle = { status: 'cancelled', changeId: op.id, changedAt: receipt.receivedAt, changedBy: op.memberId, reason };
       } else {
-        if (!operationId(op.claimId)) return reject('A release must name the exact accepted claim ID.');
-        if (!current) return reject('This item has no current offer to release. Review its latest availability.');
-        if (current.memberId !== op.memberId) return reject('Only the current owner can release this bring item.');
-        if (current.id !== op.claimId) return reject('This offer has changed since your release was saved. The newer claim was not removed.');
-        action.bringClaims = action.bringClaims.filter(claim => claim.id !== current.id);
+        if (action.lifecycle.status === 'superseded' || action.lifecycle.replacementActionId !== undefined) return reject('This listing already has a replacement. Review the linked plan; a second successor was not created.');
+        if (!actionId(op.replacementActionId) || op.replacementActionId === action.id || snapshot.actions.some(existing => existing.id === op.replacementActionId)) return reject('Choose a fresh replacement plan ID. The original and existing plans were not changed.');
+        const validation = validateActionInput(op.action);
+        if (validation.error) return reject(validation.error);
+        const kind = action.lifecycle.status === 'cancelled' ? 'restart' : 'change';
+        const successor = createActionRecord(op.replacementActionId, validation.value, op.memberId, now);
+        successor.origin = { actionId: action.id, reason, kind };
+        if (kind === 'change') {
+          action.lifecycle = { status: 'superseded', changeId: op.id, changedAt: receipt.receivedAt, changedBy: op.memberId, reason, replacementActionId: successor.id };
+        } else {
+          action.lifecycle = { ...action.lifecycle, replacementActionId: successor.id };
+        }
+        snapshot.actions.push(successor);
+      }
+    } else {
+      if (action.lifecycle.status !== 'active' && !(op.type === 'bring-item' && op.intent === 'release')) return reject(`This plan is ${action.lifecycle.status}. Its participation is historical; review the current listing before making a new request. No submission was redirected.`);
+      if (action.membershipVersion === 'DEMO-MEMBERS-v1' && !MEMBERS.has(op.memberId) && ['vote', 'close', 'minutes', 'complete-task'].includes(op.type)) return reject('This legacy example vote is limited to its three synthetic demo members. Join a community-created action to take part with your own profile.');
+      if (['contribute', 'minutes'].includes(op.type) && (typeof op.text !== 'string' || !op.text.trim() || op.text.length > 2000)) return reject('Enter between 1 and 2,000 characters.');
+      if (op.type === 'vote') {
+        if (!['approve', 'oppose', 'abstain'].includes(op.choice)) return reject('Choose approve, oppose, or abstain.');
+        if (action.outcome !== 'open') return reject('This vote is closed. Your saved ballot was not accepted before the closing deadline.');
+        if (action.ballots.some(ballot => ballot.memberId === op.memberId)) return reject('This demo member already has an accepted final ballot for this action. A second device does not add a vote.');
+        action.ballots.push({ id: op.id, memberId: op.memberId, choice: op.choice, createdAt: receipt.receivedAt });
+      } else if (op.type === 'contribute') {
+        if (op.parentId !== undefined && op.replyTo !== undefined && op.parentId !== op.replyTo) return reject('A reply must name one parent comment.');
+        const parentId = op.parentId ?? op.replyTo;
+        if (parentId !== undefined && (typeof parentId !== 'string' || !action.contributions.some(parent => parent.id === parentId))) return reject('Reply to a comment on this action. A comment from another action cannot be used as the parent.');
+        action.contributions.push({ id: op.id, memberId: op.memberId, text: op.text.trim(), createdAt: receipt.receivedAt, ...(parentId !== undefined ? { parentId } : {}) });
+      } else if (op.type === 'close') {
+        if (action.outcome !== 'open') return reject('This demo vote has already closed.');
+        closeAction(action, now);
+      } else if (op.type === 'minutes') {
+        if (action.outcome === 'open') return reject('Close the demo vote before publishing its decision notes.');
+        action.minutes.push({ id: op.id, memberId: op.memberId, text: op.text.trim(), createdAt: receipt.receivedAt });
+      } else if (op.type === 'complete-task') {
+        if (action.outcome !== 'adopted') return reject('Next-action completion is available after a plan is adopted.');
+        if (!TASKS.has(op.taskId)) return reject('This task does not belong to this action’s plan.');
+        if (action.completedTasks.some(task => task.id === op.taskId)) return reject('This task is already marked complete. It is counted once for this action.');
+        action.completedTasks.push({ id: op.taskId, memberId: op.memberId, createdAt: receipt.receivedAt });
+      } else if (op.type === 'react') {
+        if (typeof op.active !== 'boolean') return reject('Choose whether this reaction is active.');
+        const existing = action.reactions.find(record => record.memberId === op.memberId);
+        if (op.active && !existing) action.reactions.push({ memberId: op.memberId, createdAt: receipt.receivedAt });
+        if (!op.active) action.reactions = action.reactions.filter(record => record.memberId !== op.memberId);
+      } else if (op.type === 'rsvp') {
+        if (!action.planning || action.planning.kind === 'idea') return reject('RSVPs are available for plans with gathering details.');
+        if (!['going', 'maybe', 'none'].includes(op.status)) return reject('Choose going, maybe, or no RSVP.');
+        action.rsvps = action.rsvps.filter(record => record.memberId !== op.memberId);
+        if (op.status !== 'none') action.rsvps.push({ memberId: op.memberId, status: op.status, createdAt: receipt.receivedAt });
+      } else if (op.type === 'bring-item') {
+        const slots = action.planning?.bring?.length ?? 0;
+        if (!Number.isSafeInteger(op.itemIndex) || op.itemIndex < 0 || op.itemIndex >= slots) return reject('Choose a listed bring item by its valid item index. No item was changed.');
+        if (!['claim', 'release'].includes(op.intent)) return reject('Choose whether to offer or release this bring item.');
+        const current = action.bringClaims.find(claim => claim.itemIndex === op.itemIndex);
+        if (op.intent === 'claim') {
+          if (op.claimId !== undefined) return reject('A new offer must not include a previous claim ID. Review this item and offer again.');
+          if (current) return reject('This item already has an accepted offer. Review its current owner before trying another available item.');
+          action.bringClaims.push({ id: op.id, itemIndex: op.itemIndex, memberId: op.memberId, createdAt: receipt.receivedAt });
+        } else {
+          if (!operationId(op.claimId)) return reject('A release must name the exact accepted claim ID.');
+          if (!current) return reject('This item has no current offer to release. Review its latest availability.');
+          if (current.memberId !== op.memberId) return reject('Only the current owner can release this bring item.');
+          if (current.id !== op.claimId) return reject('This offer has changed since your release was saved. The newer claim was not removed.');
+          action.bringClaims = action.bringClaims.filter(claim => claim.id !== current.id);
+        }
       }
     }
   }

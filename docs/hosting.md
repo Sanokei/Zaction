@@ -34,6 +34,18 @@ The server serializes claims. A release must match the acting owner and the exac
 
 The public nickname and item intention are visible to the room. Accepted offers do not change voting weight, ballots, going/maybe RSVPs, private progress, task completion, or verified attendance/delivery. They are statements of intent; no notification, purchase, or booking is performed.
 
+## Author changes, cancellation, and preserved history
+
+Plan lifecycle metadata is additive within schema version 2. Missing legacy lifecycle metadata defaults to active; malformed existing metadata is an error rather than permission to reset records. Listing status (`active`, `superseded`, or `cancelled`) is separate from the proposal's `outcome`. An adopted group decision can therefore remain adopted in history after its author withdraws the listing. Inactive listings do not manufacture a later decision just because an old deadline passes.
+
+An author change requires the original author's session, the exact expected lifecycle token, a short reason, and a validated fresh replacement ID and plan. The server atomically links the old and new records and marks the old listing superseded. Only editable plan fields are copied: the fresh proposal starts with no inherited ballots, RSVPs, reactions, comments, bring claims, minutes, tasks, or private progress. Private saves and pending operations are not retargeted. Original terms and participation remain accessible as history.
+
+Cancellation similarly requires the author, current lifecycle token, and explicit reason. It withdraws the Zaction listing; it does not erase votes, rewrite an adopted decision, notify participants, send outside messages, or cancel venue/vendor arrangements. **Plan again** creates an explicitly reviewed fresh linked proposal. The old cancelled ID stays cancelled, with its reason and records intact; each old listing has at most one immediate successor.
+
+Offline author drafts and operations retain their original target, lifecycle token, reason, and stable operation ID. While pending, the public original stays unchanged. A race or stale token produces a concrete rejection; a new attempt requires deliberate review rather than automatic rebasing. Stable-ID replay cannot create a duplicate successor.
+
+Superseded/cancelled plans reject new participation against their original IDs instead of silently moving it to the successor. The exact owner may still release the exact current bring-item claim on that original inactive plan. A release does not move the offer to a fresh plan or establish delivery. These controls use existing pseudonymous preview ownership, not new production authentication, group authority, notifications, payment, or location tracking.
+
 ## Configuration
 
 | Variable | Default | Purpose |

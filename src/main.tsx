@@ -3,16 +3,16 @@ import { createRoot } from 'react-dom/client';
 import App from './App';
 import '@fontsource-variable/bricolage-grotesque';
 import './styles.css';
-import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
+import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, lifecycleFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
 import { emptyLocal, loadLocal, loadCommunitySession, updateLocal, type SessionChange } from './store';
-import { parseSnapshot, validActionId } from './migrations';
+import { parseSnapshot, validActionId, validChangeContext } from './migrations';
 
 const root = createRoot(document.getElementById('root')!);
 let local: LocalState = emptyLocal();
 // The stored last selection is a startup default, not cross-tab navigation.
 // Each open tab keeps its own route target while sharing durable records.
 let activeActionId = local.selectedActionId;
-const views: View[] = ['home', 'plans', 'saved', 'profile', 'create', 'action', 'proposal', 'progress', 'learn'];
+const views: View[] = ['home', 'plans', 'saved', 'profile', 'create', 'edit', 'action', 'proposal', 'progress', 'learn'];
 function currentRoute(): { view: View; id?: string } | null {
   const [view, encodedId] = location.hash.slice(1).split('/');
   if (!views.includes(view as View)) return null;
@@ -91,6 +91,8 @@ const acceptedMessages: Record<Operation['type'], string> = {
   react: 'Your reaction is shared. It never changes a group vote.',
   rsvp: 'Your RSVP is updated. It is a plan to join, not proof of attendance.',
   'bring-item': 'Your bring-item choice is shared.',
+  'change-plan': 'The new plan is shared. Everyone can review and choose again.',
+  'cancel-plan': 'Your gathering is marked cancelled. The original group decision remains recorded.',
 };
 
 function templateDraft(cityId: CityId, kind?: GatheringKind): CreationDraft {
@@ -157,7 +159,8 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
   updateRuntime({ busy: true, error: null });
   let duplicate = false;
   const saved = await mutate(previous => {
-    if (type === 'bring-item' && previous.pending.some(item => item.type === type && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
+    const sameAuthorTransition = ['change-plan', 'cancel-plan'].includes(type) && previous.pending.some(item => ['change-plan', 'cancel-plan'].includes(item.type) && item.actionId === actionId && item.memberId === operation.memberId);
+    if (sameAuthorTransition || type === 'bring-item' && previous.pending.some(item => item.type === type && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
       duplicate = true;
       return previous;
     }
@@ -169,9 +172,34 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
   return saved && !duplicate;
 }
 
+function inputForDraft(draft: CreationDraft): ActionInput | null {
+  const input = Object.fromEntries(Object.keys(ACTION_LIMITS).map(field => [field, String(draft[field as keyof CreationDraft]).trim()])) as unknown as ActionInput;
+  if (draft.planning) input.planning = structuredClone(draft.planning);
+  if (input.title.length < 3 || input.description.length < 10 || input.proposalTitle.length < 3 || input.beneficiaries.length < 3) {
+    updateRuntime({ error: 'Add an action title, a description of at least 10 characters, a proposal title, and who benefits. Your draft is saved.' }); return null;
+  }
+  if (input.sourceUrl) {
+    try { const url = new URL(input.sourceUrl); if (url.protocol !== 'https:' || url.username || url.password) throw new Error(); }
+    catch { updateRuntime({ error: 'Use an HTTPS source link without embedded credentials, or leave the link blank. Your draft is saved.' }); return null; }
+  }
+  return input;
+}
+
+function manageablePlan(actionId: string) {
+  const plan = actionFor(local, actionId);
+  if (!plan || !local.memberId || plan.createdBy !== local.memberId || plan.sourceKind !== 'member-provided') {
+    updateRuntime({ error: 'Only this plan’s author can manage its listing using their preview profile. Your saved work stays here.' }); return null;
+  }
+  const lifecycle = lifecycleFor(plan);
+  if (lifecycle.status === 'superseded' || lifecycle.replacementActionId) {
+    updateRuntime({ error: 'This listing already has a separate new plan. Open it to prepare another change; your earlier draft is preserved.' }); return null;
+  }
+  return plan;
+}
+
 const actions: Actions = {
   navigate(view) {
-    location.hash = view + (['action', 'proposal', 'progress'].includes(view) ? `/${activeActionId}` : '');
+    location.hash = view + (['action', 'proposal', 'progress', 'edit'].includes(view) ? `/${activeActionId}` : '');
     updateRuntime({ view }); window.scrollTo({ top: 0 });
   },
   async selectAction(id, view = 'action') {
@@ -234,7 +262,7 @@ const actions: Actions = {
     return mutate(previous => ({ ...previous, drafts: { ...previous.drafts, [actionId]: { ...draftsFor(previous, actionId), [field]: text } } }));
   },
   async saveCreationDraft(draft) {
-    if (!validActionId(draft.id) || !Object.entries(ACTION_LIMITS).every(([field, limit]) => { const value = draft[field as keyof CreationDraft]; return typeof value === 'string' && value.length <= limit; })) {
+    if (draft.change || !validActionId(draft.id) || !Object.entries(ACTION_LIMITS).every(([field, limit]) => { const value = draft[field as keyof CreationDraft]; return typeof value === 'string' && value.length <= limit; })) {
       updateRuntime({ error: 'The action draft contains an unsupported field or is too long. Keep your text and review the field limits.' }); return false;
     }
     return mutate(previous => ({ ...previous, creationDraft: { ...draft } }));
@@ -252,20 +280,66 @@ const actions: Actions = {
     actions.navigate('create');
   },
   async createAction(draft) {
+    if (draft.change) { updateRuntime({ error: 'This is a change draft. Share it through the original plan’s review so its history stays linked.' }); return false; }
     if (!await actions.saveCreationDraft(draft)) return false;
-    const input = Object.fromEntries(Object.keys(ACTION_LIMITS).map(field => [field, String(draft[field as keyof CreationDraft]).trim()])) as unknown as ActionInput;
-    if (draft.planning) input.planning = structuredClone(draft.planning);
-    if (input.title.length < 3 || input.description.length < 10 || input.proposalTitle.length < 3 || input.beneficiaries.length < 3) {
-      updateRuntime({ error: 'Add an action title, a description of at least 10 characters, a proposal title, and who benefits. Your draft is saved.' }); return false;
-    }
-    if (input.sourceUrl) {
-      try { const url = new URL(input.sourceUrl); if (url.protocol !== 'https:' || url.username || url.password) throw new Error(); }
-      catch { updateRuntime({ error: 'Use an HTTPS source link without embedded credentials, or leave the link blank. Your draft is saved.' }); return false; }
-    }
+    const input = inputForDraft(draft);
+    if (!input) return false;
     if (local.snapshot?.actions.some(action => action.id === draft.id)) {
       updateRuntime({ notice: 'This action is already shared. Open it from your hub.' }); return false;
     }
     return enqueue('create-action', draft.id, { action: input });
+  },
+  async beginPlanChange(actionId) {
+    const source = manageablePlan(actionId);
+    if (!source) return false;
+    const fields = Object.fromEntries(Object.keys(ACTION_LIMITS).map(key => [key, source[key as keyof ActionInput]])) as unknown as ActionInput;
+    if (source.planning) fields.planning = structuredClone(source.planning);
+    const draft: CreationDraft = { id: crypto.randomUUID(), ...fields, change: { actionId, expectedChangeId: lifecycleFor(source).changeId, reason: '' } };
+    const saved = await mutate(previous => ({ ...previous, selectedActionId: actionId, planChangeDrafts: { ...previous.planChangeDrafts, [actionId]: previous.planChangeDrafts?.[actionId] ?? draft } }));
+    if (saved) { activeActionId = actionId; actions.navigate('edit'); }
+    return saved;
+  },
+  async savePlanChangeDraft(draft) {
+    if (!validActionId(draft.id) || !validChangeContext(draft.change) || draft.id === draft.change.actionId || !Object.entries(ACTION_LIMITS).every(([field, limit]) => typeof draft[field as keyof CreationDraft] === 'string' && String(draft[field as keyof CreationDraft]).length <= limit)) {
+      updateRuntime({ error: 'This change draft needs review. Keep your entered details; its original target has not been replaced.' }); return false;
+    }
+    const sourceId = draft.change.actionId;
+    return mutate(previous => ({ ...previous, planChangeDrafts: { ...previous.planChangeDrafts, [sourceId]: structuredClone(draft) } }));
+  },
+  async reviewPlanChangeDraft(actionId) {
+    if (runtime.connectivity !== 'online') {
+      updateRuntime({ error: 'Connect and refresh the original listing before reviewing another attempt. Your entered change stays saved here.' }); return false;
+    }
+    const source = manageablePlan(actionId);
+    if (!source) return false;
+    if (local.pending.some(item => ['change-plan', 'cancel-plan'].includes(item.type) && item.actionId === actionId)) {
+      updateRuntime({ error: 'This plan already has a saved change waiting for acceptance. Sync it before reviewing another attempt.' }); return false;
+    }
+    const changeId = lifecycleFor(source).changeId;
+    return mutate(previous => {
+      const draft = previous.planChangeDrafts?.[actionId];
+      if (!draft?.change) return previous;
+      return { ...previous, planChangeDrafts: { ...previous.planChangeDrafts, [actionId]: { ...draft, change: { ...draft.change, expectedChangeId: changeId } } } };
+    });
+  },
+  async publishPlanChange(draft) {
+    if (!await actions.savePlanChangeDraft(draft) || !draft.change) return false;
+    const input = inputForDraft(draft);
+    if (!input) return false;
+    const reason = draft.change.reason.trim();
+    if (reason.length < 5 || reason.length > 600) { updateRuntime({ error: 'Explain the change in 5–600 characters. Your draft is saved.' }); return false; }
+    if (local.snapshot?.actions.some(item => item.id === draft.id)) { updateRuntime({ notice: 'This new plan is already shared. Open it to review its fresh participation.' }); return false; }
+    return enqueue('change-plan', draft.change.actionId, { action: input, replacementActionId: draft.id, expectedChangeId: draft.change.expectedChangeId, changeReason: reason });
+  },
+  async saveCancelDraft(actionId, reason) {
+    if (!validActionId(actionId) || typeof reason !== 'string' || reason.length > 600) return false;
+    return mutate(previous => ({ ...previous, cancelDrafts: { ...previous.cancelDrafts, [actionId]: reason } }));
+  },
+  async cancelPlan(actionId, reason, expectedChangeId) {
+    if (!await actions.saveCancelDraft(actionId, reason)) return false;
+    const trimmed = reason.trim();
+    if (trimmed.length < 5 || trimmed.length > 600) { updateRuntime({ error: 'Explain the cancellation in 5–600 characters. Your reason is saved here.' }); return false; }
+    return enqueue('cancel-plan', actionId, { changeReason: trimmed, expectedChangeId });
   },
   async publishContribution(actionId, text, parentId) {
     const trimmed = text.trim();

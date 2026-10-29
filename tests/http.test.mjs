@@ -293,3 +293,162 @@ test('bring-item HTTP rejects invalid indexes, missing release identity, and unk
     assert.ok(snapshot.actions.every(action => action.bringClaims.length === 0));
   });
 });
+
+const replacementPlan = (fields = {}) => ({
+  title: 'Neighborhood picnic on a better day',
+  description: 'Meet our neighbors with a revised rain plan and a shorter shopping list.',
+  proposalTitle: 'Agree on the revised neighborhood picnic', beneficiaries: 'Our local neighbors',
+  whenWhere: 'A public park, new details to be agreed', sourceLabel: '', sourceUrl: '',
+  planning: { kind: 'potluck', date: '', timeHint: 'Late afternoon', cityId: 'new-york', place: 'Public park',
+    budgetCents: 1800, expectedPeople: 6, rainPlan: 'Move to another day if rain is likely', accessibility: 'Step-free access',
+    bring: ['Water', 'Fruit'] },
+  ...fields,
+});
+
+test('authenticated author plan replacement is atomic, keeps the old decision history, and starts fresh participation', async () => {
+  await withServer(async ({ request }) => {
+    const { maya, noah, operation, send } = await bringFixture(request);
+    const contribute = await send(operation(noah, 'picnic-one', { type: 'contribute', text: 'Can we pick a day with less rain?' }), noah.token);
+    assert.equal(contribute.receipt.accepted, true);
+    assert.equal((await send(operation(noah, 'picnic-one', { type: 'react', active: true }), noah.token)).receipt.accepted, true);
+    assert.equal((await send(operation(maya, 'picnic-one', { type: 'rsvp', status: 'going' }), maya.token)).receipt.accepted, true);
+    const claim = operation(noah, 'picnic-one', { itemIndex: 0, intent: 'claim' });
+    assert.equal((await send(claim, noah.token)).receipt.accepted, true);
+    for (const profile of [maya, noah]) assert.equal((await send(operation(profile, 'picnic-one', { type: 'vote', choice: 'approve' }), profile.token)).receipt.accepted, true);
+    assert.equal((await send(operation(maya, 'picnic-one', { type: 'close' }), maya.token)).receipt.accepted, true);
+    assert.equal((await send(operation(maya, 'picnic-one', { type: 'minutes', text: 'The group adopted a tentative picnic plan.' }), maya.token)).receipt.accepted, true);
+    const before = (await (await request('/api/state')).json()).actions.find(action => action.id === 'picnic-one');
+    assert.equal(before.outcome, 'adopted');
+    const change = operation(maya, 'picnic-one', { type: 'change-plan', replacementActionId: 'picnic-revised', action: replacementPlan(),
+      changeReason: 'Choose a different day and reduce the estimated budget.', expectedChangeId: null });
+    const nonAuthor = await send({ ...change, id: randomUUID(), memberId: noah.profile.id }, noah.token);
+    assert.equal(nonAuthor.receipt.accepted, false);
+    const forged = await send(change, noah.token);
+    assert.equal(forged.status, 403);
+    assert.equal(forged.receipt.accepted, false);
+    const invalid = await send({ ...change, id: randomUUID(), replacementActionId: 'invalid-replacement', action: replacementPlan({ title: '' }) }, maya.token);
+    assert.equal(invalid.receipt.accepted, false);
+    assert.equal(invalid.snapshot.actions.some(action => action.id === 'invalid-replacement'), false);
+    assert.equal(invalid.snapshot.actions.find(action => action.id === 'picnic-one').lifecycle.status, 'active');
+    const accepted = await send(change, maya.token);
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.receipt.accepted, true, 'a forged request cannot reserve or poison the genuine author’s operation');
+    const oldPlan = accepted.snapshot.actions.find(action => action.id === 'picnic-one');
+    const successor = accepted.snapshot.actions.find(action => action.id === 'picnic-revised');
+    assert.equal(oldPlan.lifecycle.status, 'superseded');
+    assert.equal(oldPlan.lifecycle.changeId, change.id);
+    assert.equal(oldPlan.lifecycle.changedBy, maya.profile.id);
+    assert.equal(oldPlan.lifecycle.reason, change.changeReason);
+    assert.equal(oldPlan.lifecycle.replacementActionId, successor.id);
+    assert.deepEqual(successor.origin, { actionId: oldPlan.id, reason: change.changeReason, kind: 'change' });
+    assert.equal(successor.createdBy, maya.profile.id);
+    assert.equal(successor.planning.budgetCents, 1800);
+    assert.equal(successor.lifecycle.status, 'active');
+    assert.equal(successor.outcome, 'open');
+    for (const field of ['ballots', 'contributions', 'minutes', 'rsvps', 'reactions', 'bringClaims', 'completedTasks']) {
+      assert.deepEqual(oldPlan[field], before[field], `historical ${field} stay on their original plan`);
+      assert.deepEqual(successor[field], [], `new ${field} require fresh participation`);
+    }
+    assert.equal(oldPlan.outcome, 'adopted');
+    assert.equal(oldPlan.closedAt, before.closedAt);
+    const replay = await send(change, maya.token);
+    assert.deepEqual(replay.receipt, accepted.receipt);
+    assert.equal(replay.snapshot.actions.filter(action => action.id === successor.id).length, 1);
+    assert.equal(replay.snapshot.actions.find(action => action.id === 'picnic-two').lifecycle.status, 'active');
+  });
+});
+
+test('cancelled plans retain adopted outcomes, reject new participation, permit exact-owner release, and restart once with a fresh ID', async () => {
+  await withServer(async ({ request }) => {
+    const { maya, noah, operation, send } = await bringFixture(request);
+    const claim = operation(noah, 'picnic-one', { itemIndex: 0, intent: 'claim' });
+    assert.equal((await send(claim, noah.token)).receipt.accepted, true);
+    for (const profile of [maya, noah]) assert.equal((await send(operation(profile, 'picnic-one', { type: 'vote', choice: 'approve' }), profile.token)).receipt.accepted, true);
+    assert.equal((await send(operation(maya, 'picnic-one', { type: 'close' }), maya.token)).receipt.accepted, true);
+    const cancel = operation(maya, 'picnic-one', { type: 'cancel-plan', expectedChangeId: null, changeReason: 'The planned gathering can no longer take place.' });
+    const accepted = await send(cancel, maya.token);
+    assert.equal(accepted.receipt.accepted, true);
+    const cancelled = accepted.snapshot.actions.find(action => action.id === 'picnic-one');
+    assert.equal(cancelled.lifecycle.status, 'cancelled');
+    assert.equal(cancelled.lifecycle.changeId, cancel.id);
+    assert.equal(cancelled.outcome, 'adopted', 'author withdrawal does not rewrite the earlier group decision');
+    const historicalBallots = structuredClone(cancelled.ballots);
+    const denied = [
+      { type: 'contribute', text: 'A late comment must stay on its original target.' },
+      { type: 'react', active: true }, { type: 'rsvp', status: 'going' }, { type: 'vote', choice: 'approve' },
+      { type: 'close' }, { type: 'minutes', text: 'These are new notes after the listing became inactive.' },
+      { type: 'complete-task', taskId: 'agenda' }, { type: 'bring-item', itemIndex: 1, intent: 'claim' },
+    ];
+    for (const fields of denied) {
+      const result = await send(operation(maya, 'picnic-one', fields), maya.token);
+      assert.equal(result.receipt.accepted, false, `${fields.type} must not act on an inactive plan`);
+      assert.equal(result.receipt.actionId, 'picnic-one');
+    }
+    const foreignRelease = await send(operation(maya, 'picnic-one', { itemIndex: 0, intent: 'release', claimId: claim.id }), maya.token);
+    assert.equal(foreignRelease.receipt.accepted, false);
+    assert.equal(foreignRelease.snapshot.actions.find(action => action.id === 'picnic-one').bringClaims.length, 1);
+    const released = await send(operation(noah, 'picnic-one', { itemIndex: 0, intent: 'release', claimId: claim.id }), noah.token);
+    assert.equal(released.receipt.accepted, true);
+    assert.deepEqual(released.snapshot.actions.find(action => action.id === 'picnic-one').bringClaims, []);
+    const restart = operation(maya, 'picnic-one', { type: 'change-plan', replacementActionId: 'picnic-start-again', action: replacementPlan(),
+      changeReason: 'We have reviewed the cancellation and prepared a separate new plan.', expectedChangeId: cancel.id });
+    const stale = await send({ ...restart, id: randomUUID(), replacementActionId: 'stale-restart', expectedChangeId: null }, maya.token);
+    assert.equal(stale.receipt.accepted, false);
+    assert.equal(stale.snapshot.actions.some(action => action.id === 'stale-restart'), false);
+    const restarted = await send(restart, maya.token);
+    assert.equal(restarted.receipt.accepted, true);
+    const preserved = restarted.snapshot.actions.find(action => action.id === 'picnic-one');
+    const successor = restarted.snapshot.actions.find(action => action.id === 'picnic-start-again');
+    assert.equal(preserved.lifecycle.status, 'cancelled');
+    assert.equal(preserved.lifecycle.changeId, cancel.id);
+    assert.equal(preserved.lifecycle.reason, cancel.changeReason);
+    assert.equal(preserved.lifecycle.replacementActionId, successor.id);
+    assert.equal(preserved.outcome, 'adopted');
+    assert.deepEqual(preserved.ballots, historicalBallots);
+    assert.deepEqual(successor.origin, { actionId: preserved.id, reason: restart.changeReason, kind: 'restart' });
+    assert.deepEqual(successor.ballots, []);
+    const secondRestart = await send({ ...restart, id: randomUUID(), replacementActionId: 'another-successor' }, maya.token);
+    assert.equal(secondRestart.receipt.accepted, false);
+    assert.equal(secondRestart.snapshot.actions.some(action => action.id === 'another-successor'), false);
+    const cancelReplay = await send(cancel, maya.token);
+    assert.deepEqual(cancelReplay.receipt, accepted.receipt);
+    assert.equal(cancelReplay.snapshot.actions.find(action => action.id === 'picnic-one').lifecycle.replacementActionId, successor.id);
+    const oldTarget = await send(operation(noah, 'picnic-one', { type: 'rsvp', status: 'maybe' }), noah.token);
+    assert.equal(oldTarget.receipt.accepted, false);
+    assert.deepEqual(oldTarget.snapshot.actions.find(action => action.id === successor.id).rsvps, []);
+  });
+});
+
+test('author cancel-versus-change requests with the same lifecycle token have exactly one winner', async () => {
+  await withServer(async ({ request }) => {
+    const { maya, operation, send } = await bringFixture(request);
+    const missingToken = await send(operation(maya, 'picnic-one', { type: 'cancel-plan', changeReason: 'This request omitted explicit lifecycle consent.' }), maya.token);
+    assert.equal(missingToken.receipt.accepted, false);
+    const reusedTarget = await send(operation(maya, 'picnic-one', { type: 'change-plan', expectedChangeId: null,
+      replacementActionId: 'picnic-two', action: replacementPlan(), changeReason: 'Do not replace an unrelated existing plan.' }), maya.token);
+    assert.equal(reusedTarget.receipt.accepted, false);
+    const cancel = operation(maya, 'picnic-one', { type: 'cancel-plan', expectedChangeId: null, changeReason: 'This gathering needs to be cancelled.' });
+    const change = operation(maya, 'picnic-one', { type: 'change-plan', expectedChangeId: null,
+      replacementActionId: 'race-successor', action: replacementPlan(), changeReason: 'The weather calls for a revised plan.' });
+    const outcomes = await Promise.all([send(cancel, maya.token), send(change, maya.token)]);
+    assert.deepEqual(outcomes.map(result => result.status), [200, 200]);
+    assert.equal(outcomes.filter(result => result.receipt.accepted).length, 1);
+    const cancelWon = outcomes[0].receipt.accepted;
+    const current = await (await request('/api/state')).json();
+    const source = current.actions.find(action => action.id === 'picnic-one');
+    assert.equal(source.lifecycle.status, cancelWon ? 'cancelled' : 'superseded');
+    assert.equal(source.lifecycle.changeId, cancelWon ? cancel.id : change.id);
+    assert.equal(current.actions.some(action => action.id === 'race-successor'), !cancelWon);
+    assert.equal(current.actions.length, cancelWon ? 3 : 4);
+    const loser = cancelWon ? change : cancel;
+    const rejectedReceipt = cancelWon ? outcomes[1].receipt : outcomes[0].receipt;
+    const replay = await send(loser, maya.token);
+    assert.deepEqual(replay.receipt, rejectedReceipt);
+    assert.equal(replay.snapshot.actions.find(action => action.id === 'picnic-one').lifecycle.changeId, source.lifecycle.changeId);
+    const synthetic = await send({ ...operation(maya, 'reading-circle', { type: 'cancel-plan', expectedChangeId: null, changeReason: 'A synthetic example has no actual listing author.' }),
+      memberId: 'alex', membershipVersion: 'DEMO-MEMBERS-v1' });
+    assert.equal(synthetic.status, 200);
+    assert.equal(synthetic.receipt.accepted, false);
+    assert.equal(synthetic.snapshot.actions.find(action => action.id === 'reading-circle').lifecycle.status, 'active');
+  });
+});

@@ -1,6 +1,6 @@
 export type MemberId = string;
 export type Choice = 'approve' | 'oppose' | 'abstain';
-export type View = 'home' | 'plans' | 'saved' | 'profile' | 'create' | 'action' | 'proposal' | 'progress' | 'learn';
+export type View = 'home' | 'plans' | 'saved' | 'profile' | 'create' | 'edit' | 'action' | 'proposal' | 'progress' | 'learn';
 export type Outcome = 'open' | 'adopted' | 'not-adopted' | 'no-quorum';
 export const DEFAULT_ACTION_ID = 'reading-circle';
 export const MEMBERS: { id: MemberId; name: string; color: string }[] = [
@@ -65,7 +65,10 @@ export interface ActionInput {
   sourceUrl: string;
   planning?: Planning;
 }
-export interface CreationDraft extends ActionInput { id: string }
+export interface PlanChangeContext { actionId: string; expectedChangeId: string | null; reason: string }
+export interface CreationDraft extends ActionInput { id: string; change?: PlanChangeContext }
+export interface PlanLifecycle { status: 'active' | 'superseded' | 'cancelled'; changeId: string | null; changedAt: string | null; changedBy: MemberId | null; reason: string; replacementActionId?: string }
+export interface PlanOrigin { actionId: string; reason: string; kind: 'change' | 'restart' }
 export const emptyActionInput = (): ActionInput => ({ title: '', description: '', proposalTitle: '', beneficiaries: '', whenWhere: '', sourceLabel: '', sourceUrl: '' });
 export interface Contribution { id: string; memberId: MemberId; text: string; createdAt: string; parentId?: string }
 export interface Ballot { id: string; memberId: MemberId; choice: Choice; createdAt: string }
@@ -88,12 +91,16 @@ export interface CivicAction extends ActionInput {
   reactions?: Reaction[];
   rsvps?: Rsvp[];
   bringClaims?: BringClaim[];
+  lifecycle?: PlanLifecycle;
+  origin?: PlanOrigin;
 }
+export const lifecycleFor = (action: CivicAction): PlanLifecycle => action.lifecycle ?? { status: 'active', changeId: null, changedAt: null, changedBy: null, reason: '' };
+export const isPlanActive = (action: CivicAction) => lifecycleFor(action).status === 'active';
 export interface DemoSnapshot { schemaVersion: 2; roomId: string; sequence: number; actions: CivicAction[]; profiles?: CommunityProfile[] }
 export interface Operation {
   id: string;
   memberId: MemberId;
-  type: 'create-action' | 'contribute' | 'vote' | 'close' | 'minutes' | 'complete-task' | 'react' | 'rsvp' | 'bring-item';
+  type: 'create-action' | 'contribute' | 'vote' | 'close' | 'minutes' | 'complete-task' | 'react' | 'rsvp' | 'bring-item' | 'change-plan' | 'cancel-plan';
   actionId: string;
   proposalRevision: 1;
   rulesVersion: 'DEMO-RULES-v1';
@@ -109,6 +116,9 @@ export interface Operation {
   itemIndex?: number;
   intent?: 'claim' | 'release';
   claimId?: string;
+  expectedChangeId?: string | null;
+  replacementActionId?: string;
+  changeReason?: string;
 }
 export interface Receipt { id: string; actionId: string; accepted: boolean; reason: string; receivedAt: string; type: Operation['type']; operation?: Operation }
 export interface ActionDrafts { discussion: string; minutes: string }
@@ -128,6 +138,8 @@ export interface LocalState {
   community?: CommunityPreferences;
   savedActionIds?: string[];
   replyTargets?: Record<string, string | null>;
+  planChangeDrafts?: Record<string, CreationDraft>;
+  cancelDrafts?: Record<string, string>;
 }
 export interface AppState extends LocalState {
   view: View;
@@ -152,6 +164,12 @@ export interface Actions {
   saveCreationDraft(draft: CreationDraft): Promise<boolean>;
   newAction(kind?: GatheringKind): Promise<void>;
   createAction(draft: CreationDraft): Promise<boolean>;
+  beginPlanChange(actionId: string): Promise<boolean>;
+  savePlanChangeDraft(draft: CreationDraft): Promise<boolean>;
+  publishPlanChange(draft: CreationDraft): Promise<boolean>;
+  reviewPlanChangeDraft(actionId: string): Promise<boolean>;
+  saveCancelDraft(actionId: string, reason: string): Promise<boolean>;
+  cancelPlan(actionId: string, reason: string, expectedChangeId: string | null): Promise<boolean>;
   publishContribution(actionId: string, text: string, parentId?: string): Promise<void>;
   setReplyTo(actionId: string, parentId: string | null): Promise<void>;
   finishOnboarding(profile: OnboardingInput): Promise<boolean>;

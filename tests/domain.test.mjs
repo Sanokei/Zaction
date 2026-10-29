@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDemoData, applyOperation, createDemoStore, migrateDemoData } from '../server.mjs';
@@ -824,5 +824,258 @@ for (const [label, fields] of [
     const result = createAction(data, 'invalid-social-plan', { planning: planning(fields) });
     assert.equal(result.receipt.accepted, false);
     assert.equal(result.snapshot.actions.length, 1);
+  });
+}
+
+const lifecycleChange = (op, fields = {}) => op({ type: 'change-plan', replacementActionId: 'updated-bbq', expectedChangeId: null,
+  changeReason: 'Move the gathering to a more accessible location.', action: authored({ title: 'A more accessible neighborhood BBQ', planning: planning({ place: 'A step-free public pavilion', bring: ['Water', 'Water'] }) }), ...fields });
+
+test('author replacement is atomic, preserves adopted history, and starts a fresh linked proposal', async () => {
+  await withCommunityStore(async ({ store, first, second, op }) => {
+    await store.submit(await op({ type: 'contribute', text: 'Please keep the original discussion available.' }));
+    await store.submit(await op({ type: 'react', active: true }));
+    await store.submit(await op({ type: 'rsvp', status: 'going' }));
+    await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' }));
+    await store.submit(await op({ type: 'vote', choice: 'approve' }));
+    await store.submit(await op({ type: 'vote', memberId: second.profile.id, choice: 'approve' }));
+    await store.submit(await op({ type: 'close' }));
+    await store.submit(await op({ type: 'minutes', text: 'The original proposal was adopted; logistics still require confirmation.' }));
+    const before = target(await store.getState(), 'community-bbq');
+    const change = await lifecycleChange(op, { changeReason: '  Move to a step-free pavilion after reviewing access.  ' });
+    const result = await store.submit(change);
+    assert.equal(result.receipt.accepted, true);
+    const original = target(result.snapshot, 'community-bbq');
+    for (const key of Object.keys(before).filter(key => key !== 'lifecycle')) assert.deepEqual(original[key], before[key], `${key} remains historical on its original target`);
+    assert.deepEqual(original.lifecycle, { status: 'superseded', changeId: change.id, changedAt: result.receipt.receivedAt, changedBy: first.profile.id,
+      reason: change.changeReason.trim(), replacementActionId: 'updated-bbq' });
+    const successor = target(result.snapshot, 'updated-bbq');
+    assert.deepEqual(successor.origin, { actionId: 'community-bbq', reason: change.changeReason.trim(), kind: 'change' });
+    assert.equal(successor.createdBy, first.profile.id);
+    assert.equal(successor.lifecycle.status, 'active');
+    assert.equal(successor.outcome, 'open');
+    for (const field of ['contributions', 'ballots', 'rsvps', 'reactions', 'bringClaims', 'minutes', 'completedTasks']) assert.deepEqual(successor[field], [], `the replacement does not copy ${field}`);
+    const replay = await store.submit(change);
+    assert.deepEqual(replay.receipt, result.receipt);
+    assert.equal(replay.snapshot.actions.filter(action => action.origin?.actionId === 'community-bbq').length, 1);
+    const retargeted = await store.submit({ ...change, replacementActionId: 'another-orphan' });
+    assert.equal(retargeted.receipt.accepted, false);
+    assert.equal(retargeted.snapshot.actions.some(action => action.id === 'another-orphan'), false);
+  });
+});
+
+test('author lifecycle tokens ignore unrelated room changes but reject missing, stale, unauthorized, and authorless requests', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    const prepared = await lifecycleChange(op);
+    const original = target(await store.getState(), 'community-bbq');
+    const missingToken = { ...prepared, id: randomUUID() }; delete missingToken.expectedChangeId;
+    const requests = [missingToken, { ...prepared, id: randomUUID(), expectedChangeId: 'unseen-transition' },
+      { ...prepared, id: randomUUID(), memberId: second.profile.id }, { ...prepared, id: randomUUID(), expectedChangeId: undefined },
+      { ...prepared, id: randomUUID(), changeReason: 'tiny' }, { ...prepared, id: randomUUID(), changeReason: 'x'.repeat(601) },
+      await op({ actionId: SEED, type: 'cancel-plan', expectedChangeId: null, changeReason: 'Do not let a member withdraw an authorless example.' })];
+    for (const request of requests) {
+      const result = await store.submit(request);
+      assert.equal(result.receipt.accepted, false);
+      assert.deepEqual(target(result.snapshot, 'community-bbq'), original);
+      assert.equal(result.snapshot.actions.some(action => action.id === 'updated-bbq'), false);
+    }
+    await store.submit(await op({ type: 'contribute', memberId: second.profile.id, text: 'An unrelated comment must not stale the author’s lifecycle token.' }));
+    const accepted = await store.submit(prepared);
+    assert.equal(accepted.receipt.accepted, true, 'the active null token is independent of global snapshot sequence');
+  });
+});
+
+for (const [label, fields] of [
+  ['missing replacement ID', { replacementActionId: undefined }],
+  ['original ID reuse', { replacementActionId: 'community-bbq' }],
+  ['occupied replacement ID', { replacementActionId: SEED }],
+  ['reserved replacement ID', { replacementActionId: '__proto__' }],
+  ['missing replacement fields', { action: undefined }],
+  ['invalid replacement title', { action: authored({ title: '' }) }],
+  ['unsafe replacement source', { action: authored({ sourceUrl: 'javascript:alert(1)' }) }],
+  ['unsupported money field', { action: authored({ budget: 100 }) }],
+]) {
+  test(`invalid author replacement leaves no orphan and preserves original terms: ${label}`, async () => {
+    await withCommunityStore(async ({ store, op }) => {
+      const before = target(await store.getState(), 'community-bbq');
+      const change = await lifecycleChange(op, fields);
+      const rejected = await store.submit(change);
+      assert.equal(rejected.receipt.accepted, false);
+      assert.equal(rejected.snapshot.actions.length, 2);
+      assert.deepEqual(target(rejected.snapshot, 'community-bbq'), before);
+      assert.deepEqual((await store.submit(change)).receipt, rejected.receipt);
+    });
+  });
+}
+
+for (const firstType of ['cancel-plan', 'change-plan']) {
+  test(`serialized cancellation versus replacement accepts only the first ${firstType} request`, async () => {
+    await withCommunityStore(async ({ store, op }) => {
+      const cancel = await op({ type: 'cancel-plan', expectedChangeId: null, changeReason: 'The author needs to withdraw this tentative gathering.' });
+      const change = await lifecycleChange(op);
+      const requests = firstType === 'cancel-plan' ? [cancel, change] : [change, cancel];
+      const results = await Promise.all(requests.map(request => store.submit(request)));
+      assert.deepEqual(results.map(result => result.receipt.accepted), [true, false]);
+      const original = target(await store.getState(), 'community-bbq');
+      assert.equal(original.lifecycle.status, firstType === 'cancel-plan' ? 'cancelled' : 'superseded');
+      assert.equal(original.lifecycle.changeId, requests[0].id);
+      assert.equal((await store.getState()).actions.filter(action => action.origin?.actionId === 'community-bbq').length, firstType === 'cancel-plan' ? 0 : 1);
+      assert.deepEqual((await store.submit(requests[1])).receipt, results[1].receipt);
+    });
+  });
+}
+
+test('cancelled plan can create one fresh restart only after explicit review of its cancellation token', async () => {
+  await withCommunityStore(async ({ store, op }) => {
+    const cancel = await op({ type: 'cancel-plan', expectedChangeId: null, changeReason: 'The original date no longer works for the author.' });
+    const cancelled = await store.submit(cancel);
+    assert.equal(cancelled.receipt.accepted, true);
+    const cancellation = target(cancelled.snapshot, 'community-bbq').lifecycle;
+    const stale = await store.submit(await lifecycleChange(op));
+    assert.equal(stale.receipt.accepted, false);
+    const restart = await lifecycleChange(op, { expectedChangeId: cancel.id, replacementActionId: 'new-date-bbq', changeReason: 'Try a new date as a fresh plan that people can choose again.' });
+    const restarted = await store.submit(restart);
+    assert.equal(restarted.receipt.accepted, true);
+    assert.deepEqual(target(restarted.snapshot, 'community-bbq').lifecycle, { ...cancellation, replacementActionId: 'new-date-bbq' });
+    assert.deepEqual(target(restarted.snapshot, 'new-date-bbq').origin, { actionId: 'community-bbq', reason: restart.changeReason, kind: 'restart' });
+    assert.equal(target(restarted.snapshot, 'new-date-bbq').lifecycle.status, 'active');
+    assert.equal((await store.submit(await lifecycleChange(op, { expectedChangeId: cancel.id, replacementActionId: 'second-restart' }))).receipt.accepted, false);
+    assert.equal((await store.submit(await op({ type: 'cancel-plan', expectedChangeId: cancel.id, changeReason: 'Do not rewrite the original cancellation.' }))).receipt.accepted, false);
+    const oldCancelReplay = await store.submit(cancel);
+    assert.deepEqual(oldCancelReplay.receipt, cancelled.receipt);
+    assert.equal(target(oldCancelReplay.snapshot, 'community-bbq').lifecycle.replacementActionId, 'new-date-bbq');
+    assert.deepEqual((await store.submit(restart)).receipt, restarted.receipt);
+    assert.equal((await store.getState()).actions.some(action => action.id === 'second-restart'), false);
+  });
+});
+
+test('terminal plans reject fresh participation without redirecting; only exact-owner original claim releases remain allowed', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    const claim = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const acceptedClaim = await store.submit(claim);
+    const changed = await store.submit(await lifecycleChange(op));
+    const original = target(changed.snapshot, 'community-bbq');
+    for (const fields of [{ type: 'vote', choice: 'approve' }, { type: 'contribute', text: 'A queued comment must stay on its original inactive plan.' },
+      { type: 'react', active: true }, { type: 'rsvp', status: 'going' }, { type: 'close' },
+      { type: 'minutes', text: 'No new minutes may rewrite an inactive plan.' }, { type: 'complete-task', taskId: 'agenda' },
+      { type: 'bring-item', itemIndex: 1, intent: 'claim' }]) {
+      const rejected = await store.submit(await op(fields));
+      assert.equal(rejected.receipt.accepted, false, `${fields.type} is not redirected to the new plan`);
+      assert.match(rejected.receipt.reason, /superseded|historical|inactive/i);
+      assert.deepEqual(target(rejected.snapshot, 'community-bbq'), original);
+      assert.deepEqual(target(rejected.snapshot, 'updated-bbq').bringClaims, []);
+    }
+    assert.equal((await store.submit(await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'release', claimId: claim.id }))).receipt.accepted, false);
+    assert.equal((await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: 'a-stale-claim-id' }))).receipt.accepted, false);
+    assert.deepEqual((await store.submit(claim)).receipt, acceptedClaim.receipt, 'a previous accepted receipt stays accepted without creating a new intention');
+    const released = await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: claim.id }));
+    assert.equal(released.receipt.accepted, true);
+    assert.deepEqual(target(released.snapshot, 'community-bbq').bringClaims, []);
+    assert.deepEqual(target(released.snapshot, 'updated-bbq').bringClaims, []);
+    assert.equal(target(released.snapshot, 'community-bbq').lifecycle.changeId, original.lifecycle.changeId);
+  });
+});
+
+test('inactive plan expiry preserves prior open or adopted outcomes and lifecycle chains survive restart', async () => {
+  await withCommunityStore(async ({ store, first, second, op, filePath }) => {
+    const firstChange = await store.submit(await lifecycleChange(op));
+    assert.equal(firstChange.receipt.accepted, true);
+    assert.equal(target(firstChange.snapshot, 'community-bbq').outcome, 'open');
+    await store.submit(await op({ actionId: 'updated-bbq', type: 'vote', choice: 'approve' }));
+    await store.submit(await op({ actionId: 'updated-bbq', type: 'vote', memberId: second.profile.id, choice: 'approve' }));
+    await store.submit(await op({ actionId: 'updated-bbq', type: 'close' }));
+    const cancel = await op({ actionId: 'updated-bbq', type: 'cancel-plan', expectedChangeId: null, changeReason: 'Withdraw the tentative gathering without rewriting the group decision.' });
+    await store.submit(cancel);
+    const restart = await lifecycleChange(op, { actionId: 'updated-bbq', replacementActionId: 'third-bbq', expectedChangeId: cancel.id, changeReason: 'Propose a new date with fresh participation.' });
+    const created = await store.submit(restart);
+    assert.equal(created.receipt.accepted, true);
+    const before = JSON.parse(await readFile(filePath, 'utf8'));
+    const restored = await createDemoStore({ filePath, now: () => NOW + 9 * 24 * 60 * 60 * 1000 });
+    const snapshot = await restored.getState();
+    assert.equal(target(snapshot, 'community-bbq').outcome, 'open');
+    assert.equal(target(snapshot, 'community-bbq').closedAt, null);
+    assert.equal(target(snapshot, 'updated-bbq').outcome, 'adopted');
+    assert.equal(target(snapshot, 'third-bbq').outcome, 'no-quorum', 'only the active successor expires normally');
+    assert.deepEqual(target(snapshot, 'community-bbq').lifecycle, target(before.snapshot, 'community-bbq').lifecycle);
+    assert.deepEqual(target(snapshot, 'updated-bbq').lifecycle, target(before.snapshot, 'updated-bbq').lifecycle);
+    assert.equal(await restored.authorized(first.profile.id, first.token), true);
+    assert.deepEqual((await restored.submit(restart)).receipt, created.receipt);
+    const after = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(after.receipts, before.receipts);
+    assert.deepEqual(after.sessions, before.sessions);
+  });
+});
+
+test('a failed atomic file replacement cannot expose a staged lifecycle or orphan successor', async () => {
+  await withCommunityStore(async ({ store, first, op, filePath }) => {
+    const before = await store.getState();
+    const original = await readFile(filePath, 'utf8');
+    const preserved = filePath + '.preserved';
+    const change = await lifecycleChange(op);
+    await rename(filePath, preserved);
+    await mkdir(filePath);
+    try {
+      await assert.rejects(store.submit(change));
+      assert.deepEqual(await store.getState(), before, 'the in-memory snapshot is committed only after atomic persistence succeeds');
+      assert.equal(await readFile(preserved, 'utf8'), original);
+    } finally { await rm(filePath, { recursive: true, force: true }); await rename(preserved, filePath); }
+    assert.equal(await store.authorized(first.profile.id, first.token), true);
+    const retry = await store.submit(change);
+    assert.equal(retry.receipt.accepted, true);
+    assert.equal(retry.snapshot.actions.filter(action => action.origin?.actionId === 'community-bbq').length, 1);
+  });
+});
+
+test('legacy lifecycle defaults additively and the explicit demo author retains controls on a member-provided plan', () => {
+  let legacy = createDemoData(NOW);
+  legacy = createAction(legacy, 'old-authored-plan').data;
+  for (const action of legacy.snapshot.actions) delete action.lifecycle;
+  legacy.keepUnknownRoot = { future: true };
+  target(legacy, 'old-authored-plan').keepUnknownAction = 'preserve';
+  const migrated = migrateDemoData(legacy);
+  assert.ok(migrated.snapshot.actions.every(action => action.lifecycle.status === 'active' && action.lifecycle.changeId === null));
+  assert.equal(migrated.snapshot.roomId, legacy.snapshot.roomId);
+  assert.deepEqual(migrated.receipts, legacy.receipts);
+  assert.deepEqual(migrated.sessions, legacy.sessions);
+  assert.deepEqual(migrated.keepUnknownRoot, legacy.keepUnknownRoot);
+  assert.equal(target(migrated, 'old-authored-plan').keepUnknownAction, 'preserve');
+  assert.ok(legacy.snapshot.actions.every(action => !Object.hasOwn(action, 'lifecycle')));
+  const changed = applyOperation(migrated, operation(migrated, { actionId: 'old-authored-plan', type: 'change-plan', replacementActionId: 'demo-authored-successor', expectedChangeId: null,
+    changeReason: 'The original explicit demo author may prepare another plan.', action: authored() }), NOW);
+  assert.equal(changed.receipt.accepted, true);
+  const invalid = structuredClone(migrated); target(invalid, 'old-authored-plan').lifecycle = undefined;
+  assert.throws(() => migrateDemoData(invalid), /corrupt|unsupported/i, 'a present malformed field never defaults active');
+});
+
+const lifecycleCorruptions = [
+  ['null lifecycle', data => { target(data, 'community-bbq').lifecycle = null; }],
+  ['unknown status', data => { target(data, 'community-bbq').lifecycle.status = 'published-again'; }],
+  ['invalid token', data => { target(data, 'community-bbq').lifecycle.changeId = '__proto__'; }],
+  ['invalid timestamp', data => { target(data, 'community-bbq').lifecycle.changedAt = 'not-a-date'; }],
+  ['wrong author', data => { target(data, 'community-bbq').lifecycle.changedBy = 'river'; }],
+  ['missing replacement', data => { target(data, 'community-bbq').lifecycle.replacementActionId = 'missing-plan'; }],
+  ['missing origin', data => { delete target(data, 'updated-bbq').origin; }],
+  ['origin on wrong source', data => { target(data, 'updated-bbq').origin.actionId = SEED; }],
+  ['wrong origin kind', data => { target(data, 'updated-bbq').origin.kind = 'restart'; }],
+  ['origin reason mismatch', data => { target(data, 'updated-bbq').origin.reason = 'A different unexplained transition.'; }],
+  ['oversized padded transition reason', data => { const reason = ' '.repeat(601) + 'Reviewed change'; target(data, 'community-bbq').lifecycle.reason = reason; target(data, 'updated-bbq').origin.reason = reason; }],
+  ['active source with a successor', data => { target(data, 'community-bbq').lifecycle = { status: 'active', changeId: null, changedAt: null, changedBy: null, reason: '', replacementActionId: 'updated-bbq' }; }],
+  ['lifecycle cycle', data => {
+    const source = target(data, 'community-bbq'); const successor = target(data, 'updated-bbq');
+    successor.lifecycle = { status: 'superseded', changeId: 'cycle-change', changedAt: new Date(NOW).toISOString(), changedBy: source.createdBy, reason: source.lifecycle.reason, replacementActionId: source.id };
+    source.origin = { actionId: successor.id, reason: source.lifecycle.reason, kind: 'change' };
+  }],
+];
+for (const [label, corrupt] of lifecycleCorruptions) {
+  test(`malformed lifecycle preserves the saved original file: ${label}`, async () => {
+    await withCommunityStore(async ({ store, op, filePath }) => {
+      assert.equal((await store.submit(await lifecycleChange(op))).receipt.accepted, true);
+      const data = JSON.parse(await readFile(filePath, 'utf8'));
+      corrupt(data);
+      const original = JSON.stringify(data, null, 2);
+      await writeFile(filePath, original);
+      assert.throws(() => migrateDemoData(data), /corrupt|unsupported/i);
+      await assert.rejects(createDemoStore({ filePath, now: () => NOW }), /corrupt|unsupported/i);
+      assert.equal(await readFile(filePath, 'utf8'), original);
+    });
   });
 }

@@ -1,9 +1,12 @@
-import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, MEMBERS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt } from './model';
+import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, MEMBERS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt, type PlanChangeContext } from './model';
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): value is RecordValue => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const reservedActionIds = new Set([...Object.getOwnPropertyNames(Object.prototype), 'prototype']);
 export const validActionId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value) && !reservedActionIds.has(value);
+const validOperationId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
+export const validChangeContext = (value: unknown): value is PlanChangeContext => record(value) && validActionId(value.actionId) && (value.expectedChangeId === null || validOperationId(value.expectedChangeId)) && typeof value.reason === 'string' && value.reason.length <= 600;
+const creationDraftValid = (value: unknown) => record(value) && validActionId(value.id) && Object.keys(ACTION_LIMITS).every(key => typeof value[key] === 'string') && (!Object.hasOwn(value, 'change') || validChangeContext(value.change));
 const progressValid = (value: unknown) => record(value) && typeof value.read === 'boolean' && typeof value.reviewed === 'boolean';
 const textDraftValid = (value: unknown) => record(value) && typeof value.discussion === 'string' && typeof value.minutes === 'string';
 const actionStateValid = (value: unknown) => record(value) && value.proposalRevision === 1 && value.rulesVersion === 'DEMO-RULES-v1' && ['DEMO-MEMBERS-v1', 'COMMUNITY-PREVIEW-v1'].includes(String(value.membershipVersion)) && typeof value.closesAt === 'string' && Number.isFinite(Date.parse(value.closesAt)) && ['open', 'adopted', 'not-adopted', 'no-quorum'].includes(String(value.outcome)) && ['contributions', 'ballots', 'minutes', 'completedTasks'].every(key => Array.isArray(value[key]));
@@ -11,10 +14,25 @@ const actionStateValid = (value: unknown) => record(value) && value.proposalRevi
 export function parseSnapshot(value: unknown): DemoSnapshot {
   if (!record(value) || value.schemaVersion !== 2 || typeof value.roomId !== 'string' || !value.roomId || !Number.isSafeInteger(value.sequence) || Number(value.sequence) < 0 || !Array.isArray(value.actions)) throw new Error('The demo room returned an unsupported record. Local work is preserved.');
   const ids = new Set<string>();
+  const actions: RecordValue[] = [];
   const memberIds = new Set(Array.isArray(value.profiles) ? value.profiles.filter(record).map(profile => profile.id) : MEMBERS.map(profile => profile.id));
   for (const item of value.actions) {
     if (!record(item) || !validActionId(item.id) || ids.has(item.id) || !actionStateValid(item) || !Object.keys(ACTION_LIMITS).every(key => typeof item[key] === 'string')) throw new Error('The demo room returned an invalid action. Local work is preserved.');
     ids.add(item.id);
+    actions.push(item);
+    if (Object.hasOwn(item, 'lifecycle')) {
+      const life = item.lifecycle;
+      const invalid = () => { throw new Error('The plan returned invalid lifecycle information. Local work is preserved.'); };
+      if (!record(life) || !['active', 'superseded', 'cancelled'].includes(String(life.status)) || typeof life.reason !== 'string') return invalid();
+      if (life.status === 'active') {
+        if (life.changeId !== null || life.changedAt !== null || life.changedBy !== null || life.reason !== '' || Object.hasOwn(life, 'replacementActionId')) return invalid();
+      } else {
+        if (!validOperationId(life.changeId) || typeof life.changedAt !== 'string' || !Number.isFinite(Date.parse(life.changedAt)) || !memberIds.has(life.changedBy) || life.changedBy !== item.createdBy || item.sourceKind !== 'member-provided' || life.reason.trim().length < 5 || life.reason.length > 600) return invalid();
+        if (life.status === 'superseded' && !validActionId(life.replacementActionId)) return invalid();
+        if (Object.hasOwn(life, 'replacementActionId') && (!validActionId(life.replacementActionId) || life.replacementActionId === item.id)) return invalid();
+      }
+    }
+    if (Object.hasOwn(item, 'origin') && (!record(item.origin) || !validActionId(item.origin.actionId) || item.origin.actionId === item.id || !['change', 'restart'].includes(String(item.origin.kind)) || typeof item.origin.reason !== 'string' || item.origin.reason.trim().length < 5 || item.origin.reason.length > 600)) throw new Error('The plan returned an invalid history link. Local work is preserved.');
     if (Object.hasOwn(item, 'bringClaims')) {
       if (!Array.isArray(item.bringClaims)) throw new Error('The plan returned unsupported bring-item choices. Local work is preserved.');
       const slots = new Set<number>();
@@ -26,6 +44,30 @@ export function parseSnapshot(value: unknown): DemoSnapshot {
         claims.add(claim.id);
       }
     }
+  }
+  const byId = new Map(actions.map(action => [action.id, action]));
+  for (const action of actions) {
+    const life = action.lifecycle;
+    if (record(life) && typeof life.replacementActionId === 'string') {
+      const next = byId.get(life.replacementActionId);
+      const origin = next?.origin;
+      if (!next || !record(origin) || origin.actionId !== action.id || next.createdBy !== action.createdBy || next.sourceKind !== 'member-provided' || origin.kind !== (life.status === 'cancelled' ? 'restart' : 'change') || life.status === 'superseded' && origin.reason !== life.reason) throw new Error('The plan returned inconsistent replacement links. Local work is preserved.');
+    }
+    if (record(action.origin)) {
+      const previous = byId.get(action.origin.actionId);
+      if (!previous || !record(previous.lifecycle) || previous.lifecycle.replacementActionId !== action.id) throw new Error('The plan returned a missing original listing. Local work is preserved.');
+    }
+  }
+  const checked = new Set<unknown>();
+  for (const action of actions) {
+    const chain = new Set<unknown>();
+    let current: RecordValue | undefined = action;
+    while (current && !checked.has(current.id)) {
+      if (chain.has(current.id)) throw new Error('The plan returned a cyclic history link. Local work is preserved.');
+      chain.add(current.id);
+      current = record(current.lifecycle) && typeof current.lifecycle.replacementActionId === 'string' ? byId.get(current.lifecycle.replacementActionId) : undefined;
+    }
+    for (const id of chain) checked.add(id);
   }
   if (value.profiles !== undefined && (!Array.isArray(value.profiles) || !value.profiles.every(profile => record(profile) && typeof profile.id === 'string' && typeof profile.name === 'string' && /^#[a-fA-F0-9]{6}$/.test(String(profile.color)) && typeof profile.synthetic === 'boolean'))) throw new Error('The community returned unsupported profiles. Local work is preserved.');
   return value as unknown as DemoSnapshot;
@@ -62,7 +104,9 @@ export function normalizeLocal(value: unknown): LocalState {
   const fail = () => { throw new Error('Saved data needs review. Your browser data has been preserved.'); };
   if (!record(value) || !Array.isArray(value.pending) || !Array.isArray(value.receipts) || (value.memberId !== null && !validActionId(value.memberId))) return fail();
   if (value.schemaVersion === 2) {
-    if (!validActionId(value.selectedActionId) || !record(value.drafts) || !record(value.progress) || !record(value.creationDraft) || !validActionId(value.creationDraft.id) || !Object.keys(ACTION_LIMITS).every(key => typeof (value.creationDraft as RecordValue)[key] === 'string')) return fail();
+    if (!validActionId(value.selectedActionId) || !record(value.drafts) || !record(value.progress) || !creationDraftValid(value.creationDraft)) return fail();
+    if (Object.hasOwn(value, 'planChangeDrafts') && (!record(value.planChangeDrafts) || !Object.entries(value.planChangeDrafts).every(([id, draft]) => validActionId(id) && creationDraftValid(draft) && record(draft) && validChangeContext(draft.change) && draft.change.actionId === id && draft.id !== id))) return fail();
+    if (Object.hasOwn(value, 'cancelDrafts') && (!record(value.cancelDrafts) || !Object.entries(value.cancelDrafts).every(([id, reason]) => validActionId(id) && typeof reason === 'string' && reason.length <= 600))) return fail();
     if (!Object.entries(value.drafts).every(([id, draft]) => validActionId(id) && textDraftValid(draft)) || !Object.entries(value.progress).every(([id, progress]) => validActionId(id) && progressValid(progress))) return fail();
     if (!value.pending.every(op => record(op) && validActionId(op.actionId)) || !value.receipts.every(receipt => record(receipt) && validActionId(receipt.actionId))) return fail();
     if (value.community !== undefined && (!record(value.community) || typeof value.community.name !== 'string' || !CITY_OPTIONS.some(city => city.id === (value.community as RecordValue).cityId) || !Array.isArray(value.community.interests) || !value.community.interests.every(interest => KIND_OPTIONS.some(kind => kind.id === interest)) || typeof value.community.onboarded !== 'boolean' || typeof value.community.browsing !== 'boolean')) return fail();

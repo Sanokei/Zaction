@@ -390,6 +390,387 @@ async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, no
   pass('malformed bring-claim responses preserve saved work and accepted ownership; logistics leave social signals, votes, progress and other plans unchanged');
 }
 
+async function captureLifecycle(page, state, locator) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} lifecycle evidence is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'lifecycle terms and reasons wrap within the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-lifecycle-${state}-390x844.png`, fullPage: false });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+}
+
+async function verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext, noahId) {
+  const items = ['Water', 'Cups'];
+  const first = await fillPlan(maya, 'bbq', 'Courtyard BBQ · original plan', '80', items);
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === first) && !(await local(maya)).pending.length, 'first lifecycle plan published');
+  const second = await fillPlan(maya, 'potluck', 'Community supper · original plan', '40', items);
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === second) && !(await local(maya)).pending.length, 'independent lifecycle plan published');
+  await foreground(noah);
+  await eventually(async () => (await local(noah)).snapshot.actions.some(action => action.id === second), 'other member sees the lifecycle plans');
+  const offer = (page, id, index) => page.getByTestId(`bring-claim-${id}-${index}`);
+  const release = (page, id, index) => page.getByTestId(`bring-release-${id}-${index}`);
+  const lifecycle = action => action.lifecycle ?? { status: 'active', changeId: null };
+  const participation = action => ({ contributions: action.contributions, ballots: action.ballots, minutes: action.minutes,
+    reactions: action.reactions ?? [], rsvps: action.rsvps ?? [], bringClaims: action.bringClaims ?? [], completedTasks: action.completedTasks,
+    outcome: action.outcome, closedAt: action.closedAt });
+  const assertFresh = action => {
+    for (const field of ['contributions', 'ballots', 'minutes', 'reactions', 'rsvps', 'bringClaims', 'completedTasks']) assert.deepEqual(action[field] ?? [], [], `${field} start empty on the fresh proposal`);
+    assert.equal(action.outcome, 'open');
+    assert.equal(action.closedAt, null);
+    assert.equal(lifecycle(action).status, 'active');
+  };
+  async function edit(page, id, title, reason, date = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10)) {
+    await select(page, id);
+    await page.getByTestId(`plan-update-${id}`).click();
+    await page.getByTestId('create-title').fill(title);
+    await page.getByTestId('plan-date').fill(date);
+    await page.getByTestId('plan-budget').fill('120');
+    await page.getByTestId('plan-location').fill('Public library courtyard; access still to be confirmed');
+    await page.getByTestId('plan-rainplan').fill('Use the accessible community room after confirming access, or postpone together.');
+    await page.getByTestId('change-reason').fill(reason);
+    await page.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(page)).planChangeDrafts?.[id]?.title === title && (await local(page)).planChangeDrafts[id].change.reason === reason, 'separate author change draft saved');
+    return (await local(page)).planChangeDrafts[id];
+  }
+  async function openCancel(page, id) {
+    await select(page, id);
+    await page.getByTestId(`plan-cancel-${id}`).click();
+    await page.getByTestId('keep-plan').waitFor();
+    await eventually(async () => page.getByTestId('keep-plan').evaluate(element => element === document.activeElement), 'cancellation initially focuses the least destructive choice');
+    return page.getByRole('dialog');
+  }
+
+  await select(maya, first);
+  await maya.getByTestId('contribution-input').fill('Keep shade, step-free access and affordable food in the agreed plan.');
+  await maya.getByTestId('publish-contribution').click();
+  await offer(maya, first, 0).click();
+  await eventually(async () => target(await snapshot(), first).bringClaims.length === 1 && target(await snapshot(), first).contributions.length === 1, 'original plan has real accepted participation');
+  await select(noah, first);
+  await noah.getByTestId(`rsvp-going-${first}`).click();
+  await eventually(async () => target(await snapshot(), first).rsvps.length === 1, 'original RSVP accepted');
+  assert.equal(await noah.getByTestId(`plan-update-${first}`).count(), 0, 'non-author has no author change control');
+  assert.equal(await noah.getByTestId(`plan-cancel-${first}`).count(), 0, 'non-author has no cancellation control');
+  for (const page of [maya, noah]) {
+    await select(page, first, 'proposal');
+    await page.getByTestId('choice-approve').check();
+    await page.getByTestId('submit-vote').click();
+    await eventually(async () => target(await snapshot(), first).ballots.some(ballot => ballot.memberId === (page === maya ? mayaId : noahId)), 'original group consent accepted');
+  }
+  await closeVote(maya);
+  await eventually(async () => target(await snapshot(), first).outcome === 'adopted', 'original proposal adopted before terms change');
+  await maya.getByTestId('minutes-input').fill('The original courtyard terms were adopted. Later replacement terms need fresh consent.');
+  await maya.getByTestId('publish-minutes').click();
+  await eventually(async () => target(await snapshot(), first).minutes.length === 1 && !(await local(maya)).pending.length, 'original minutes published');
+  await select(maya, first);
+  await maya.getByTestId(`save-${first}`).click();
+  await eventually(async () => (await local(maya)).savedActionIds.includes(first), 'original plan privately saved');
+  await navigate(maya, 'profile');
+  await maya.locator('button.progress-row').filter({ hasText: 'Read the plan' }).click();
+  await eventually(async () => (await local(maya)).progress[first]?.read === true, 'original private progress recorded before replacement');
+  await select(noah, second);
+  await offer(noah, second, 0).click();
+  await eventually(async () => target(await snapshot(), second).bringClaims.some(claim => claim.memberId === noahId), 'independent original claim accepted');
+  const secondBefore = structuredClone(target(await snapshot(), second));
+  const unrelatedId = await fillPlan(maya, 'games', 'Private unfinished game-night draft', '24', ['Cards']);
+  const unrelatedDraft = structuredClone((await local(maya)).creationDraft);
+  const unrelatedDiscussionDrafts = structuredClone((await local(maya)).drafts);
+  const reason = 'Move to a covered, accessible courtyard on the following day and review the higher shared estimate before anyone commits.';
+  const changedDraft = await edit(maya, first, 'Courtyard BBQ · revised proposal', reason);
+  assert.equal(changedDraft.change.actionId, first);
+  assert.equal(changedDraft.change.expectedChangeId, null);
+  assert.notEqual(changedDraft.id, first);
+  assert.equal(changedDraft.planning.budgetCents, 12000);
+  assert.deepEqual((await local(maya)).creationDraft, unrelatedDraft, 'editing a published plan preserves unrelated creation work');
+  const authorRoom = await snapshot();
+  const authorTarget = target(authorRoom, first);
+  const noahSession = (await local(noah, 'community-sessions'))[authorRoom.roomId];
+  const unauthorized = await fetch(`${origin}/api/operations`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${noahSession.token}` },
+    body: JSON.stringify({ id: randomUUID(), type: 'cancel-plan', memberId: noahId, actionId: first,
+      roomId: authorRoom.roomId, proposalRevision: authorTarget.proposalRevision, rulesVersion: authorTarget.rulesVersion,
+      membershipVersion: authorTarget.membershipVersion, expectedChangeId: null, changeReason: 'A non-author cannot withdraw this listing.' }),
+    signal: AbortSignal.timeout(5000),
+  });
+  const unauthorizedResult = await unauthorized.json();
+  assert.equal(unauthorizedResult.receipt.accepted, false);
+  assert.match(unauthorizedResult.receipt.reason, /author/i);
+  assert.equal(lifecycle(target(await snapshot(), first)).status, 'active');
+  await foreground(maya);
+  await eventually(async () => (await local(maya)).snapshot.sequence >= unauthorizedResult.snapshot.sequence, 'author sees an unrelated sequence change');
+  assert.equal(await maya.getByTestId('publish-plan-change').isDisabled(), false, 'another receipt does not invalidate the exact unchanged lifecycle token');
+  const comparison = await maya.getByTestId('change-comparison').innerText();
+  assert.match(comparison, /80/);
+  assert.match(comparison, /120/);
+  assert.match(comparison, /Community park/);
+  assert.match(comparison, /Public library courtyard/);
+  await captureLifecycle(maya, 'change', maya.getByTestId('change-comparison'));
+  await maya.getByTestId('change-comparison').evaluate(element => element.scrollIntoView({ block: 'start' }));
+  await maya.screenshot({ path: '/tmp/zaction-lifecycle-change-desktop.png', fullPage: false });
+  pass('author-only changes compare old and new terms in a separate durable draft while preserving unrelated work and existing group consent');
+
+  const originalBefore = structuredClone(target(await snapshot(), first));
+  await mayaContext.setOffline(true);
+  await maya.getByTestId('publish-plan-change').click();
+  await eventually(async () => (await local(maya)).pending.some(op => op.type === 'change-plan' && op.actionId === first), 'offline replacement queued against original');
+  const replacementOperation = (await local(maya)).pending.find(op => op.type === 'change-plan' && op.actionId === first);
+  assert.equal(replacementOperation.replacementActionId, changedDraft.id);
+  assert.equal(replacementOperation.expectedChangeId, null);
+  assert.equal(replacementOperation.changeReason, reason);
+  assert.deepEqual(target(await snapshot(), first), originalBefore, 'queued change has no public effect');
+  const pendingReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok(pendingReload.fromServiceWorker());
+  await eventually(async () => (await local(maya)).pending.some(op => op.id === replacementOperation.id), 'pending author transition survives worker reload');
+  assert.equal((await local(maya)).planChangeDrafts[first].planning.rainPlan, changedDraft.planning.rainPlan);
+  await captureLifecycle(maya, 'pending-change', maya.getByTestId('change-pending'));
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => lifecycle(target(await snapshot(), first)).status === 'superseded' && !(await local(maya)).pending.length, 'replacement accepted atomically');
+  const afterChange = await snapshot();
+  const replacement = target(afterChange, changedDraft.id);
+  assert.equal(lifecycle(target(afterChange, first)).replacementActionId, replacement.id);
+  assert.equal(lifecycle(target(afterChange, first)).changeId, replacementOperation.id);
+  assert.deepEqual(participation(target(afterChange, first)), participation(originalBefore), 'adopted terms and their participation remain historical');
+  assert.deepEqual(target(afterChange, second), secondBefore, 'another plan remains unchanged');
+  assertFresh(replacement);
+  assert.deepEqual(replacement.origin, { actionId: first, reason, kind: 'change' });
+  assert.equal(replacement.planning.date, changedDraft.planning.date);
+  assert.equal(replacement.planning.budgetCents, 12000);
+  assert.equal(replacement.planning.rainPlan, changedDraft.planning.rainPlan);
+  assert.equal(((await local(maya)).savedActionIds ?? []).includes(replacement.id), false, 'private saves are not retargeted');
+  assert.deepEqual((await local(maya)).progress[replacement.id] ?? { read: false, reviewed: false }, { read: false, reviewed: false });
+  assert.deepEqual((await local(maya)).creationDraft, unrelatedDraft);
+  assert.deepEqual((await local(maya)).drafts, unrelatedDiscussionDrafts, 'replacement leaves existing discussion and minutes drafts on their original targets');
+  await select(maya, first);
+  await maya.reload({ waitUntil: 'networkidle' });
+  assert.equal((await local(maya)).selectedActionId, first, 'reopening a historical URL does not silently redirect');
+  await captureLifecycle(maya, 'superseded', maya.getByTestId(`lifecycle-banner-${first}`));
+  await maya.getByTestId(`lifecycle-successor-${first}`).click();
+  await eventually(async () => (await local(maya)).selectedActionId === replacement.id, 'successor navigation requires an explicit choice');
+  pass('offline changes reopen and atomically link a fresh proposal without copying votes, RSVPs, claims, progress or silently redirecting historical links');
+
+  await select(noah, second);
+  await noahContext.setOffline(true);
+  await offer(noah, second, 1).click();
+  await noah.getByTestId(`rsvp-going-${second}`).click();
+  await select(noah, second, 'proposal');
+  await noah.getByTestId('choice-approve').check();
+  await noah.getByTestId('submit-vote').click();
+  await eventually(async () => (await local(noah)).pending.filter(op => op.actionId === second).length === 3, 'stale participant saves three original-plan intents');
+  const lateIntents = (await local(noah)).pending.filter(op => op.actionId === second);
+  const dialog = await openCancel(maya, second);
+  const focusables = await dialog.locator('button, input, textarea, select, a[href], [tabindex]').count();
+  for (const direction of ['Tab', 'Shift+Tab']) {
+    for (let index = 0; index < focusables + 2; index++) {
+      await maya.keyboard.press(direction);
+      assert.ok(await maya.evaluate(() => Boolean(document.activeElement?.closest('dialog[open]'))), 'Tab and Shift+Tab stay inside cancellation confirmation');
+    }
+  }
+  await maya.keyboard.press('Escape');
+  await eventually(async () => maya.getByTestId(`plan-cancel-${second}`).evaluate(element => element === document.activeElement), 'Escape restores cancellation trigger focus');
+  assert.equal(lifecycle(target(await snapshot(), second)).status, 'active');
+  await openCancel(maya, second);
+  const cancellationReason = 'The accessible space is unavailable. Keep the original record while we find a workable day together.';
+  await maya.getByTestId('cancel-reason').fill(cancellationReason);
+  await maya.getByTestId('keep-plan').click();
+  await eventually(async () => maya.getByTestId(`plan-cancel-${second}`).evaluate(element => element === document.activeElement), 'Keep plan restores its trigger without withdrawing anything');
+  assert.equal(lifecycle(target(await snapshot(), second)).status, 'active');
+  await openCancel(maya, second);
+  assert.equal(await maya.getByTestId('cancel-reason').inputValue(), cancellationReason, 'a dismissed reason remains a private draft');
+  await mayaContext.setOffline(true);
+  await maya.evaluate(() => {
+    // The browser still commits a real IndexedDB transaction. Delay only its
+    // completion notification to exercise a genuinely unfinished local save.
+    const descriptor = Object.getOwnPropertyDescriptor(IDBTransaction.prototype, 'oncomplete');
+    if (!descriptor?.set) throw new Error('This browser cannot expose the delayed storage-completion fixture.');
+    let armed = true;
+    const finish = [];
+    window.__releaseLifecycleSave = () => {
+      armed = false;
+      Object.defineProperty(IDBTransaction.prototype, 'oncomplete', descriptor);
+      for (const callback of finish.splice(0)) callback();
+      delete window.__lifecycleSaveHeld;
+    };
+    Object.defineProperty(IDBTransaction.prototype, 'oncomplete', {
+      ...descriptor,
+      set(listener) {
+        const transaction = this;
+        descriptor.set.call(transaction, event => {
+          const notify = () => { if (typeof listener === 'function') listener.call(transaction, event); };
+          if (armed && transaction.mode === 'readwrite') {
+            armed = false;
+            finish.push(notify);
+            window.__lifecycleSaveHeld = true;
+          } else notify();
+        });
+      },
+    });
+  });
+  try {
+    await maya.getByTestId('confirm-cancel').click();
+    await eventually(async () => maya.evaluate(() => Boolean(window.__lifecycleSaveHeld)), 'cancellation waits for real local-save completion');
+    assert.equal(await maya.getByTestId('keep-plan').isDisabled(), true, 'Keep plan cannot imply undo while confirmation is already saving');
+    assert.equal(await maya.getByRole('button', { name: 'Close dialog', exact: true }).isDisabled(), true);
+    assert.equal(await maya.getByTestId('cancel-reason').getAttribute('readonly'), '');
+    await maya.keyboard.press('Escape');
+    assert.equal(await maya.getByRole('dialog').isVisible(), true, 'Escape cannot dismiss an in-flight confirmation');
+    await maya.mouse.click(5, 5);
+    assert.equal(await maya.getByRole('dialog').isVisible(), true, 'the backdrop cannot dismiss an in-flight confirmation');
+    assert.equal(lifecycle(target(await snapshot(), second)).status, 'active');
+  } finally {
+    await maya.evaluate(() => window.__releaseLifecycleSave?.());
+  }
+  await eventually(async () => (await local(maya)).pending.some(op => op.type === 'cancel-plan' && op.actionId === second), 'offline withdrawal queued');
+  await eventually(async () => maya.locator(`#plan-management-heading-${second}`).evaluate(element => element === document.activeElement), 'durable confirmation focuses stable plan-management context');
+  const cancelOperation = (await local(maya)).pending.find(op => op.type === 'cancel-plan' && op.actionId === second);
+  assert.equal(cancelOperation.expectedChangeId, null);
+  assert.equal(cancelOperation.changeReason, cancellationReason);
+  assert.equal(lifecycle(target(await snapshot(), second)).status, 'active', 'pending withdrawal leaves the public listing active');
+  const cancelReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok(cancelReload.fromServiceWorker());
+  await eventually(async () => (await local(maya)).pending.some(op => op.id === cancelOperation.id), 'offline cancellation reopens with its exact original target and token');
+  await captureLifecycle(maya, 'pending-cancel', maya.getByTestId('cancel-pending').locator('..'));
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => lifecycle(target(await snapshot(), second)).status === 'cancelled' && !(await local(maya)).pending.length, 'author withdrawal accepted after reconnect');
+  const cancelled = structuredClone(target(await snapshot(), second));
+  assert.equal(lifecycle(cancelled).reason, cancellationReason);
+  assert.equal(lifecycle(cancelled).changeId, cancelOperation.id);
+  assert.deepEqual(participation(cancelled), participation(secondBefore), 'withdrawal preserves original accepted commitments and open outcome');
+  await captureLifecycle(maya, 'cancelled', maya.getByTestId(`lifecycle-banner-${second}`));
+  pass('cancellation contains keyboard focus, keeps the safe choice first, restores focus on dismissal and persists an honest offline withdrawal');
+
+  await noahContext.setOffline(false);
+  await foreground(noah);
+  await eventually(async () => {
+    const state = await local(noah);
+    return !state.pending.length && lateIntents.every(intent => state.receipts.some(receipt => receipt.id === intent.id && !receipt.accepted));
+  }, 'late original-plan intents receive terminal rejections');
+  for (const intent of lateIntents) {
+    const receipt = (await local(noah)).receipts.find(receipt => receipt.id === intent.id);
+    assert.equal(receipt.operation.actionId, second);
+    assert.equal(receipt.operation.type, intent.type);
+    assert.match(receipt.reason, /cancel|inactive|no longer active/i);
+  }
+  await noah.reload({ waitUntil: 'networkidle' });
+  for (const intent of lateIntents) assert.equal((await local(noah)).receipts.find(receipt => receipt.id === intent.id).accepted, false);
+  assert.deepEqual(participation(target(await snapshot(), second)), participation(cancelled));
+  await captureLifecycle(noah, 'rejected', noah.getByTestId('submission-history'));
+  await select(noah, replacement.id);
+  await offer(noah, replacement.id, 0).click();
+  await eventually(async () => target(await snapshot(), replacement.id).bringClaims.some(claim => claim.memberId === noahId), 'same item accepted independently on the new proposal');
+  const replacementClaim = target(await snapshot(), replacement.id).bringClaims[0];
+  await select(noah, second);
+  await release(noah, second, 0).click();
+  await eventually(async () => target(await snapshot(), second).bringClaims.length === 0 && !(await local(noah)).pending.length, 'exact owner release remains possible on the withdrawn original');
+  assert.equal(target(await snapshot(), replacement.id).bringClaims[0].id, replacementClaim.id, 'old-plan release cannot remove the new-plan claim');
+  assert.equal(target(await snapshot(), second).ballots.length, 0);
+  assert.equal(target(await snapshot(), second).rsvps.length, 0);
+  pass('late ballot, RSVP and bring offers stay rejected on their original plan while exact historical releases cannot touch a successor claim');
+
+  await select(maya, second);
+  await maya.getByTestId(`plan-again-${second}`).click();
+  const restartReason = 'Try a new supper proposal after the space check, with fresh consent from everyone.';
+  await maya.getByTestId('create-title').fill('Community supper · new attempt');
+  await maya.getByTestId('change-reason').fill(restartReason);
+  await maya.getByTestId('save-plan-change').click();
+  await eventually(async () => (await local(maya)).planChangeDrafts[second].change.reason === restartReason, 'restart terms saved separately');
+  const restartDraft = (await local(maya)).planChangeDrafts[second];
+  assert.equal(restartDraft.change.expectedChangeId, cancelOperation.id);
+  await maya.getByTestId('publish-plan-change').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === restartDraft.id) && !(await local(maya)).pending.length, 'cancelled plan restarts as a fresh proposal');
+  assert.equal(lifecycle(target(await snapshot(), second)).status, 'cancelled', 'Plan again never reactivates the old ID');
+  assert.equal(lifecycle(target(await snapshot(), second)).reason, cancellationReason);
+  assert.equal(lifecycle(target(await snapshot(), second)).replacementActionId, restartDraft.id);
+  assert.deepEqual(target(await snapshot(), restartDraft.id).origin, { actionId: second, reason: restartReason, kind: 'restart' });
+  assertFresh(target(await snapshot(), restartDraft.id));
+  assert.deepEqual((await local(maya)).creationDraft, unrelatedDraft);
+  assert.equal((await local(maya)).creationDraft.id, unrelatedId);
+  await select(maya, second);
+  await maya.reload({ waitUntil: 'networkidle' });
+  assert.equal((await local(maya)).selectedActionId, second);
+  await captureLifecycle(maya, 'restart', maya.getByTestId(`lifecycle-banner-${second}`));
+  pass('Plan again keeps the cancelled URL and reason intact and creates one linked proposal with fresh consent and no unrelated draft loss');
+
+  const staleTab = await openPage(mayaContext);
+  const staleReason = 'A private alternate arrangement, saved before the author withdrew this listing.';
+  const staleDraft = await edit(staleTab, restartDraft.id, 'Community supper · carefully reviewed retry', staleReason);
+  await foreground(noah);
+  await eventually(async () => (await local(noah)).snapshot.actions.some(action => action.id === restartDraft.id), 'other profile sees restarted proposal');
+  for (const page of [maya, noah]) {
+    await select(page, restartDraft.id, 'proposal');
+    await page.getByTestId('choice-approve').check();
+    await page.getByTestId('submit-vote').click();
+    await eventually(async () => target(await snapshot(), restartDraft.id).ballots.some(ballot => ballot.memberId === (page === maya ? mayaId : noahId)), 'new proposal receives its own equal ballots');
+  }
+  await closeVote(maya);
+  await eventually(async () => target(await snapshot(), restartDraft.id).outcome === 'adopted', 'restarted proposal independently adopted');
+  await openCancel(maya, restartDraft.id);
+  await maya.getByTestId('cancel-reason').fill('The host can no longer organize this date; the adopted group result remains part of the record.');
+  await maya.getByTestId('confirm-cancel').click();
+  await eventually(async () => lifecycle(target(await snapshot(), restartDraft.id)).status === 'cancelled' && !(await local(maya)).pending.length, 'adopted proposal withdrawn without changing its group result');
+  await eventually(async () => maya.locator(`#plan-management-heading-${restartDraft.id}`).evaluate(element => element === document.activeElement), 'accepted withdrawal retains useful focus after the cancellation trigger disappears');
+  const cancelledRestart = target(await snapshot(), restartDraft.id);
+  assert.equal(cancelledRestart.outcome, 'adopted');
+  assert.equal(cancelledRestart.ballots.length, 2);
+  await foreground(staleTab);
+  await staleTab.getByTestId('review-plan-change').waitFor();
+  assert.equal((await local(staleTab)).planChangeDrafts[restartDraft.id].change.expectedChangeId, staleDraft.change.expectedChangeId, 'background synchronization does not silently rebase saved author intent');
+  assert.equal(await staleTab.getByTestId('create-title').inputValue(), staleDraft.title);
+  assert.ok(await staleTab.getByTestId('publish-plan-change').isDisabled(), 'stale terms require review before a new attempt');
+  await captureLifecycle(staleTab, 'stale', staleTab.locator('.creation-form'));
+  await staleTab.getByTestId('review-plan-change').click();
+  await eventually(async () => (await local(staleTab)).planChangeDrafts[restartDraft.id].change.expectedChangeId === lifecycle(cancelledRestart).changeId, 'explicit review adopts the current cancellation token');
+  assert.equal(await staleTab.getByTestId('create-title').inputValue(), staleDraft.title);
+  assert.equal(await staleTab.getByTestId('change-reason').inputValue(), staleReason);
+  const reviewed = (await local(staleTab)).planChangeDrafts[restartDraft.id];
+  await staleTab.getByTestId('publish-plan-change').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === reviewed.id) && !(await local(staleTab)).pending.length, 'explicitly reviewed restart accepted');
+  assertFresh(target(await snapshot(), reviewed.id));
+  assert.equal(target(await snapshot(), reviewed.id).origin.kind, 'restart');
+  assert.equal(target(await snapshot(), restartDraft.id).outcome, 'adopted');
+  assert.deepEqual((await local(staleTab)).creationDraft, unrelatedDraft);
+  await select(staleTab, reviewed.id);
+  await captureLifecycle(staleTab, 'recovery', staleTab.getByTestId(`lifecycle-origin-${reviewed.id}`));
+  await staleTab.close();
+  pass('stale author drafts remain private until explicit review, and withdrawing an adopted listing preserves the decision before a fresh restart');
+
+  const finalDraft = await edit(maya, reviewed.id, 'Community supper · final reviewed proposal', 'Use the newly confirmed accessible room; everyone can reconsider this fresh proposal.');
+  const attempts = [];
+  let loseResponse = true;
+  await mayaContext.route('**/api/operations', async route => {
+    const operation = route.request().postDataJSON();
+    if (operation.type !== 'change-plan' || operation.actionId !== reviewed.id) return route.continue();
+    attempts.push(operation.id);
+    if (!loseResponse) return route.continue();
+    await route.fetch();
+    await route.abort('failed');
+  });
+  try {
+    await maya.getByTestId('publish-plan-change').click();
+    await eventually(async () => attempts.length > 0 && (await snapshot()).actions.some(action => action.id === finalDraft.id) && (await local(maya)).pending.some(op => op.id === attempts[0]), 'actual replacement committed while its response is lost');
+    const stableId = attempts[0];
+    await mayaContext.setOffline(true);
+    const lostReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(lostReload.fromServiceWorker());
+    assert.ok((await local(maya)).pending.some(op => op.id === stableId && op.actionId === reviewed.id && op.replacementActionId === finalDraft.id));
+    loseResponse = false;
+    await mayaContext.setOffline(false);
+    await foreground(maya);
+    await eventually(async () => !(await local(maya)).pending.length && (await local(maya)).receipts.some(receipt => receipt.id === stableId && receipt.accepted), 'lost response recovers the stable lifecycle receipt');
+    assert.ok(attempts.length >= 2);
+    assert.equal(new Set(attempts).size, 1);
+    assert.equal((await snapshot()).actions.filter(action => action.origin?.actionId === reviewed.id).length, 1, 'replay creates exactly one successor');
+    assert.equal(lifecycle(target(await snapshot(), reviewed.id)).replacementActionId, finalDraft.id);
+    assertFresh(target(await snapshot(), finalDraft.id));
+    assert.deepEqual((await local(maya)).creationDraft, unrelatedDraft);
+  } finally { await mayaContext.unroute('**/api/operations'); }
+  pass('a committed replacement with a lost response replays its original target and ID after worker reload and creates exactly one successor');
+}
+
 try {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(`Server exited: ${output}`);
@@ -771,6 +1152,7 @@ try {
   pass('legacy browser identity, discussion, progress and exact migration backup survive the community upgrade');
 
   await verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, noahId);
+  await verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext, noahId);
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept
