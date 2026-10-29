@@ -50,6 +50,7 @@ export interface CommunityProfile { id: MemberId; name: string; color: string; c
 export type RsvpStatus = 'going' | 'maybe' | 'none';
 export interface Reaction { memberId: MemberId; createdAt: string }
 export interface Rsvp { memberId: MemberId; status: Exclude<RsvpStatus, 'none'>; createdAt: string }
+export interface BringClaim { id: string; itemIndex: number; memberId: MemberId; createdAt: string }
 export type WeatherResult = {
   status: 'available'; cityId: string; date: string; checkedAt: string; sourceUrl: string;
   temperatureMaxF: number; temperatureMinF: number; rainChance: number; windMph: number; description: string; stale: boolean; reason?: string;
@@ -86,12 +87,13 @@ export interface CivicAction extends ActionInput {
   completedTasks: { id: string; memberId: MemberId; createdAt: string }[];
   reactions?: Reaction[];
   rsvps?: Rsvp[];
+  bringClaims?: BringClaim[];
 }
 export interface DemoSnapshot { schemaVersion: 2; roomId: string; sequence: number; actions: CivicAction[]; profiles?: CommunityProfile[] }
 export interface Operation {
   id: string;
   memberId: MemberId;
-  type: 'create-action' | 'contribute' | 'vote' | 'close' | 'minutes' | 'complete-task' | 'react' | 'rsvp';
+  type: 'create-action' | 'contribute' | 'vote' | 'close' | 'minutes' | 'complete-task' | 'react' | 'rsvp' | 'bring-item';
   actionId: string;
   proposalRevision: 1;
   rulesVersion: 'DEMO-RULES-v1';
@@ -104,6 +106,9 @@ export interface Operation {
   parentId?: string;
   active?: boolean;
   status?: RsvpStatus;
+  itemIndex?: number;
+  intent?: 'claim' | 'release';
+  claimId?: string;
 }
 export interface Receipt { id: string; actionId: string; accepted: boolean; reason: string; receivedAt: string; type: Operation['type']; operation?: Operation }
 export interface ActionDrafts { discussion: string; minutes: string }
@@ -154,6 +159,8 @@ export interface Actions {
   savePreferences(preferences: Partial<OnboardingInput>): Promise<boolean>;
   react(actionId: string, active: boolean): Promise<void>;
   rsvp(actionId: string, status: RsvpStatus): Promise<void>;
+  claimBringItem(actionId: string, itemIndex: number): Promise<boolean>;
+  releaseBringItem(actionId: string, itemIndex: number, claimId: string): Promise<boolean>;
   toggleSave(actionId: string): Promise<void>;
   getWeather(cityId: string, date: string): Promise<WeatherResult>;
   castVote(actionId: string, choice: Choice): Promise<void>;

@@ -74,6 +74,8 @@ jobs:
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
           A runnable community PWA preview with public-pseudonym onboarding, a social feed, illustrated plan templates, comments/replies, interest signals, private saves, and going/maybe RSVPs. Members can plan a BBQ, potluck, games, walk, practical help, or civic idea. Templates are suggestions, not fabricated events or crowds.
 
+          Bring & share lets a member offer one of a plan's fixed item entries, see the accepted public nickname, and release their own offer. Each entry has one accepted owner; duplicate labels are separate slots. Exact-claim releases prevent delayed work from removing a later reclaim. Pending claims do not reserve and pending releases do not free an item; conflicts require review before a deliberate retry. These public intentions do not affect ballots, RSVPs, personal progress, task completion, or verified attendance/delivery.
+
           Per-person cost estimates support planning without payments or bookings. Open-Meteo forecast lookup has explicit unavailable, stale, and out-of-range states; weather data is never invented. Live-provider access is separate from controlled integration tests and must be assessed from the actual release evidence.
 
           Proposal ballots remain separate from reactions and RSVPs. Eligible profiles each have equal voting weight; profile count is not proof of unique people. Personal progress and shared milestones do not increase that weight. Member content and sources remain public and unverified.

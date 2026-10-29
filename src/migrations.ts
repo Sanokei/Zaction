@@ -1,4 +1,4 @@
-import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt } from './model';
+import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, MEMBERS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt } from './model';
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): value is RecordValue => Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -11,9 +11,21 @@ const actionStateValid = (value: unknown) => record(value) && value.proposalRevi
 export function parseSnapshot(value: unknown): DemoSnapshot {
   if (!record(value) || value.schemaVersion !== 2 || typeof value.roomId !== 'string' || !value.roomId || !Number.isSafeInteger(value.sequence) || Number(value.sequence) < 0 || !Array.isArray(value.actions)) throw new Error('The demo room returned an unsupported record. Local work is preserved.');
   const ids = new Set<string>();
+  const memberIds = new Set(Array.isArray(value.profiles) ? value.profiles.filter(record).map(profile => profile.id) : MEMBERS.map(profile => profile.id));
   for (const item of value.actions) {
     if (!record(item) || !validActionId(item.id) || ids.has(item.id) || !actionStateValid(item) || !Object.keys(ACTION_LIMITS).every(key => typeof item[key] === 'string')) throw new Error('The demo room returned an invalid action. Local work is preserved.');
     ids.add(item.id);
+    if (Object.hasOwn(item, 'bringClaims')) {
+      if (!Array.isArray(item.bringClaims)) throw new Error('The plan returned unsupported bring-item choices. Local work is preserved.');
+      const slots = new Set<number>();
+      const claims = new Set<string>();
+      for (const claim of item.bringClaims) {
+        const list = record(item.planning) && Array.isArray(item.planning.bring) ? item.planning.bring : [];
+        if (!record(claim) || typeof claim.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(claim.id) || ['__proto__', 'constructor', 'prototype'].includes(claim.id) || claims.has(claim.id) || !memberIds.has(claim.memberId) || typeof claim.createdAt !== 'string' || !Number.isFinite(Date.parse(claim.createdAt)) || typeof claim.itemIndex !== 'number' || !Number.isSafeInteger(claim.itemIndex) || claim.itemIndex < 0 || claim.itemIndex >= list.length || typeof list[claim.itemIndex] !== 'string' || !list[claim.itemIndex].trim() || slots.has(claim.itemIndex)) throw new Error('The plan returned invalid bring-item choices. Local work is preserved.');
+        slots.add(claim.itemIndex);
+        claims.add(claim.id);
+      }
+    }
   }
   if (value.profiles !== undefined && (!Array.isArray(value.profiles) || !value.profiles.every(profile => record(profile) && typeof profile.id === 'string' && typeof profile.name === 'string' && /^#[a-fA-F0-9]{6}$/.test(String(profile.color)) && typeof profile.synthetic === 'boolean'))) throw new Error('The community returned unsupported profiles. Local work is preserved.');
   return value as unknown as DemoSnapshot;

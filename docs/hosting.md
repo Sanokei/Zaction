@@ -24,6 +24,16 @@ The existing room JSON file now also contains a private map of session-token has
 
 New public profiles have pseudonyms and coarse city IDs; interests and private saves stay on the device. The server checks a profile's session for owned writes, but this does not establish a unique human, protect against all abuse, or provide account recovery. The intentionally tokenless legacy identities remain explicit compatibility tools rather than onboarding defaults.
 
+## Bring-item intentions and upgrade preservation
+
+Bring & share adds an optional `bringClaims` collection to each action within schema version 2. Existing actions without that collection are treated as having no accepted item offers; existing records, private sessions, ballots, RSVPs, notes, and room IDs are preserved. A malformed stored collection is an error to review, not permission to reset the room or replace saved data.
+
+Each immutable published `planning.bring` entry is a distinct slot identified by action ID and its original item index. Duplicate labels are separate slots. A single member may offer several items, but each slot has only one accepted owner. This increment provides no editing/reordering, quantities, shared ownership, payment, or automatic assignment; do not reorder published entries in the backing file as a workaround.
+
+The server serializes claims. A release must match the acting owner and the exact currently accepted claim ID, so a delayed offline release cannot remove a later reclaim. Stable retries return the original receipt. Pending claims do not reserve an item, pending releases do not free it, and the confirmed owner remains visible until acceptance. A conflict is a rejected receipt: the member reviews current availability before a deliberate new attempt.
+
+The public nickname and item intention are visible to the room. Accepted offers do not change voting weight, ballots, going/maybe RSVPs, private progress, task completion, or verified attendance/delivery. They are statements of intent; no notification, purchase, or booking is performed.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -43,7 +53,7 @@ Use `npm run check:weather` in a source checkout for a separate live-provider sm
 
 The start/dev-server and weather-check scripts enable Node's environment-proxy support with `--use-env-proxy`, requiring Node.js 24.5+. This preserves HTTPS verification. The actual cloud smoke check exited 1 with an unavailable result; an unmocked browser request also observed unavailable. The environment draft adds `api.open-meteo.com` to its preserved network requirements, but that saved change was not yet applied to the running instance. Retry after the relevant runtime configuration changes; saving a requirement alone is not a passing provider check.
 
-CI and release workflows make a separate nonblocking live-provider observation with a notice or warning. Inspect that step's actual result: overall workflow success and the 81 fixture/domain/HTTP checks do not imply provider success.
+CI and release workflows make a separate nonblocking live-provider observation with a notice or warning. Inspect that step's actual result: overall workflow success and fixture/domain/HTTP checks do not imply provider success.
 
 ## Public hosting
 

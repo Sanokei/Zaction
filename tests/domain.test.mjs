@@ -116,6 +116,248 @@ for (const [label, fields] of [
   });
 }
 
+test('bring offers use immutable item indexes, keeping duplicate labels and separate plans distinct', async () => {
+  await withCommunityStore(async ({ store, first, second, op }) => {
+    const created = await store.submit(await op({ type: 'create-action', actionId: 'duplicate-items', action: authored({ planning: planning({ bring: ['Water', 'Water'] }) }) }));
+    assert.equal(created.receipt.accepted, true);
+    assert.deepEqual(target(created.snapshot, 'duplicate-items').bringClaims, []);
+    const firstOffer = await op({ type: 'bring-item', actionId: 'duplicate-items', itemIndex: 0, intent: 'claim' });
+    const accepted = await store.submit(firstOffer);
+    assert.equal(accepted.receipt.accepted, true);
+    assert.deepEqual(target(accepted.snapshot, 'duplicate-items').bringClaims, [{ id: firstOffer.id, itemIndex: 0, memberId: first.profile.id, createdAt: accepted.receipt.receivedAt }]);
+    const secondSlot = await store.submit(await op({ type: 'bring-item', actionId: 'duplicate-items', itemIndex: 1, intent: 'claim' }));
+    assert.equal(secondSlot.receipt.accepted, true, 'one person may offer multiple distinct slots');
+    const otherPlan = await store.submit(await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'claim' }));
+    assert.equal(otherPlan.receipt.accepted, true);
+    assert.equal(target(otherPlan.snapshot, 'duplicate-items').bringClaims.length, 2);
+    assert.equal(target(otherPlan.snapshot, 'community-bbq').bringClaims.length, 1);
+    assert.equal(target(otherPlan.snapshot).bringClaims.length, 0);
+    const alteredTarget = await store.submit({ ...firstOffer, actionId: 'community-bbq' });
+    assert.equal(alteredTarget.receipt.accepted, false);
+    const alteredIndex = await store.submit({ ...firstOffer, itemIndex: 1 });
+    assert.equal(alteredIndex.receipt.accepted, false);
+    assert.deepEqual(target(alteredIndex.snapshot, 'duplicate-items').bringClaims, target(otherPlan.snapshot, 'duplicate-items').bringClaims);
+  });
+});
+
+test('serialized competing bring offers choose one owner without replacement, including a same-owner second offer', async () => {
+  await withCommunityStore(async ({ store, first, second, op }) => {
+    const offerA = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const offerB = await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'claim' });
+    const results = await Promise.all([store.submit(offerA), store.submit(offerB)]);
+    assert.deepEqual(results.map(result => result.receipt.accepted), [true, false]);
+    const original = target(results[0].snapshot, 'community-bbq').bringClaims[0];
+    assert.equal(original.memberId, first.profile.id);
+    const duplicate = await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' }));
+    assert.equal(duplicate.receipt.accepted, false, 'a fresh operation cannot replace even the same person’s current offer');
+    assert.deepEqual(target(duplicate.snapshot, 'community-bbq').bringClaims, [original]);
+    const replay = await store.submit(offerA);
+    assert.deepEqual(replay.receipt, results[0].receipt);
+    assert.deepEqual(target(replay.snapshot, 'community-bbq').bringClaims, [original]);
+  });
+});
+
+test('bring release requires its owner and exact claim, preventing stale same-owner ABA and old replay takeover', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    const originalOffer = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const acceptedOriginal = await store.submit(originalOffer);
+    const unauthorized = await store.submit(await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'release', claimId: originalOffer.id }));
+    assert.equal(unauthorized.receipt.accepted, false);
+    const releaseOriginal = await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: originalOffer.id });
+    const released = await store.submit(releaseOriginal);
+    assert.equal(released.receipt.accepted, true);
+    assert.deepEqual(target(released.snapshot, 'community-bbq').bringClaims, []);
+    const reclaimedOffer = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const reclaimed = await store.submit(reclaimedOffer);
+    assert.equal(reclaimed.receipt.accepted, true);
+    const staleNewRelease = await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: originalOffer.id }));
+    assert.equal(staleNewRelease.receipt.accepted, false);
+    assert.match(staleNewRelease.receipt.reason, /changed|newer/i);
+    assert.equal(target(staleNewRelease.snapshot, 'community-bbq').bringClaims[0].id, reclaimedOffer.id);
+    const releaseReplay = await store.submit(releaseOriginal);
+    assert.deepEqual(releaseReplay.receipt, released.receipt);
+    assert.equal(target(releaseReplay.snapshot, 'community-bbq').bringClaims[0].id, reclaimedOffer.id, 'an accepted old release receipt does not release a newer reclaim');
+    const firstClaimReplay = await store.submit(originalOffer);
+    assert.deepEqual(firstClaimReplay.receipt, acceptedOriginal.receipt);
+    assert.equal(target(firstClaimReplay.snapshot, 'community-bbq').bringClaims[0].id, reclaimedOffer.id);
+    assert.equal((await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: reclaimedOffer.id }))).receipt.accepted, true);
+    const secondPerson = await store.submit(await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'claim' }));
+    assert.equal(secondPerson.receipt.accepted, true);
+    const afterReplay = await store.submit(originalOffer);
+    assert.deepEqual(afterReplay.receipt, acceptedOriginal.receipt);
+    assert.equal(target(afterReplay.snapshot, 'community-bbq').bringClaims[0].memberId, second.profile.id, 'replaying the original claim never takes an item back from its later owner');
+  });
+});
+
+test('a conflicted bring offer stays rejected on replay; a reviewed new operation may claim a newly open item', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    const current = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    await store.submit(current);
+    const pendingOther = await op({ type: 'bring-item', memberId: second.profile.id, itemIndex: 0, intent: 'claim' });
+    const conflict = await store.submit(pendingOther);
+    assert.equal(conflict.receipt.accepted, false);
+    await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: current.id }));
+    const replay = await store.submit(pendingOther);
+    assert.deepEqual(replay.receipt, conflict.receipt);
+    assert.deepEqual(target(replay.snapshot, 'community-bbq').bringClaims, []);
+    const deliberateRetry = await store.submit({ ...pendingOther, id: randomUUID() });
+    assert.equal(deliberateRetry.receipt.accepted, true);
+    assert.equal(target(deliberateRetry.snapshot, 'community-bbq').bringClaims[0].memberId, second.profile.id);
+  });
+});
+
+test('bring intentions remain independent of RSVPs, ballots, task completion, and vote closure', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    await store.submit(await op({ type: 'rsvp', status: 'going' }));
+    await store.submit(await op({ type: 'vote', choice: 'approve' }));
+    await store.submit(await op({ type: 'vote', memberId: second.profile.id, choice: 'oppose' }));
+    await store.submit(await op({ type: 'close' }));
+    const before = target(await store.getState(), 'community-bbq');
+    assert.equal(before.outcome, 'not-adopted');
+    const claim = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const accepted = await store.submit(claim);
+    assert.equal(accepted.receipt.accepted, true, 'closed vote does not prevent an item intention');
+    const released = await store.submit(await op({ type: 'bring-item', itemIndex: 0, intent: 'release', claimId: claim.id }));
+    assert.equal(released.receipt.accepted, true);
+    const after = target(released.snapshot, 'community-bbq');
+    for (const field of ['rsvps', 'ballots', 'reactions', 'completedTasks', 'outcome', 'closedAt', 'contributions', 'minutes']) assert.deepEqual(after[field], before[field], `${field} is independent of item intentions`);
+  });
+});
+
+for (const [label, fields] of [
+  ['missing index', { itemIndex: undefined }],
+  ['negative index', { itemIndex: -1 }],
+  ['fractional index', { itemIndex: 0.5 }],
+  ['text index', { itemIndex: '0' }],
+  ['out-of-range index', { itemIndex: 2 }],
+  ['unsafe integer index', { itemIndex: Number.MAX_SAFE_INTEGER + 1 }],
+  ['invalid intent', { intent: 'reserve-with-payment' }],
+  ['release without claim identity', { intent: 'release' }],
+  ['release with reserved claim identity', { intent: 'release', claimId: '__proto__' }],
+  ['claim with stale release identity', { intent: 'claim', claimId: 'an-old-offer' }],
+  ['action without listed items', { actionId: SEED }],
+]) {
+  test(`bring operations reject ${label} without inventing or changing a slot`, () => {
+    let data = createDemoData(NOW);
+    data = createAction(data, 'bring-bbq', { planning: planning() }).data;
+    const result = applyOperation(data, operation(data, { type: 'bring-item', actionId: 'bring-bbq', itemIndex: 0, intent: 'claim', ...fields }), NOW);
+    assert.equal(result.receipt.accepted, false);
+    assert.deepEqual(target(result.snapshot, 'bring-bbq').bringClaims, []);
+    assert.deepEqual(target(result.snapshot).bringClaims, []);
+  });
+}
+
+test('bring ownership and operation receipts survive file restart without exposing or changing private sessions', async () => {
+  await withCommunityStore(async ({ store, first, second, op, filePath }) => {
+    const original = await op({ type: 'bring-item', itemIndex: 0, intent: 'claim' });
+    const claimed = await store.submit(original);
+    const before = JSON.parse(await readFile(filePath, 'utf8'));
+    const restored = await createDemoStore({ filePath, now: () => NOW + 1 });
+    assert.equal(await restored.authorized(first.profile.id, first.token), true);
+    assert.equal(await restored.authorized(second.profile.id, second.token), true);
+    const replay = await restored.submit(original);
+    assert.deepEqual(replay.receipt, claimed.receipt);
+    assert.deepEqual(target(replay.snapshot, 'community-bbq').bringClaims, target(claimed.snapshot, 'community-bbq').bringClaims);
+    const after = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(after.sessions, before.sessions);
+    assert.deepEqual(after.receipts, before.receipts);
+    assert.equal(Object.hasOwn(replay.snapshot, 'sessions'), false);
+    assert.equal(JSON.stringify(replay.snapshot).includes(first.token), false);
+  });
+});
+
+test('legacy missing bring collections migrate additively while preserving room, receipts, private data, and unknown metadata', async () => {
+  await withCommunityStore(async ({ store, first, op, filePath }) => {
+    await store.submit(await op({ type: 'contribute', text: 'An existing discussion must stay intact.' }));
+    await store.submit(await op({ type: 'vote', choice: 'approve' }));
+    const legacy = JSON.parse(await readFile(filePath, 'utf8'));
+    for (const action of legacy.snapshot.actions) delete action.bringClaims;
+    legacy.futureMetadata = { keep: ['unknown', 'private-store-extension'] };
+    legacy.snapshot.actions[1].futureActionField = 'retain this';
+    const original = JSON.stringify(legacy, null, 2);
+    await writeFile(filePath, original);
+    const migrated = migrateDemoData(legacy);
+    assert.equal(migrated.snapshot.roomId, legacy.snapshot.roomId);
+    assert.deepEqual(migrated.receipts, legacy.receipts);
+    assert.deepEqual(migrated.sessions, legacy.sessions);
+    assert.deepEqual(migrated.futureMetadata, legacy.futureMetadata);
+    assert.equal(migrated.snapshot.actions[1].futureActionField, 'retain this');
+    assert.ok(migrated.snapshot.actions.every(action => Array.isArray(action.bringClaims) && action.bringClaims.length === 0));
+    assert.ok(legacy.snapshot.actions.every(action => !Object.hasOwn(action, 'bringClaims')), 'the migration is pure');
+    const restored = await createDemoStore({ filePath, now: () => NOW + 1 });
+    assert.equal(await restored.authorized(first.profile.id, first.token), true);
+    const state = await restored.getState();
+    assert.deepEqual(target(state, 'community-bbq').contributions, target(legacy.snapshot, 'community-bbq').contributions);
+    assert.deepEqual(target(state, 'community-bbq').ballots, target(legacy.snapshot, 'community-bbq').ballots);
+    assert.equal(state.roomId, legacy.snapshot.roomId);
+    const disk = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(disk.futureMetadata, legacy.futureMetadata);
+    assert.deepEqual(disk.receipts, legacy.receipts);
+    assert.deepEqual(disk.sessions, legacy.sessions);
+  });
+});
+
+const validBringClaim = fields => ({ id: 'saved-offer', itemIndex: 0, memberId: 'alex', createdAt: new Date(NOW).toISOString(), ...fields });
+
+test('migration defaults only an absent bring collection and rejects present undefined or unlisted saved claims', () => {
+  const data = createDemoData(NOW);
+  target(data).bringClaims = undefined;
+  assert.throws(() => migrateDemoData(data), /corrupt|unsupported/i);
+  assert.ok(Object.hasOwn(target(data), 'bringClaims'));
+  target(data).bringClaims = [validBringClaim({})];
+  assert.throws(() => migrateDemoData(data), /corrupt|unsupported/i, 'claims cannot invent slots on an action without a bring list');
+});
+
+for (const [label, text] of [['empty', ''], ['whitespace-only', '   ']]) {
+  test(`a saved bring claim for an ${label} item label preserves the corrupt original file`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'zaction-blank-bring-'));
+    try {
+      const filePath = join(directory, 'room.json');
+      let data = createDemoData(NOW);
+      data = createAction(data, 'bring-bbq', { planning: planning() }).data;
+      const action = target(data, 'bring-bbq');
+      action.planning.bring[0] = text;
+      action.bringClaims = [validBringClaim({})];
+      const original = JSON.stringify(data, null, 2);
+      await writeFile(filePath, original);
+      assert.throws(() => migrateDemoData(data), /corrupt|unsupported/i);
+      await assert.rejects(createDemoStore({ filePath, now: () => NOW }), /corrupt|unsupported/i);
+      assert.equal(await readFile(filePath, 'utf8'), original);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+for (const [label, claims] of [
+  ['null collection', null],
+  ['object collection', {}],
+  ['unknown member', [validBringClaim({ memberId: 'not-registered' })]],
+  ['invalid claim ID', [validBringClaim({ id: '__proto__' })]],
+  ['missing claim ID', [validBringClaim({ id: undefined })]],
+  ['invalid timestamp', [validBringClaim({ createdAt: 'not-a-date' })]],
+  ['non-string timestamp', [validBringClaim({ createdAt: NOW })]],
+  ['negative slot', [validBringClaim({ itemIndex: -1 })]],
+  ['fractional slot', [validBringClaim({ itemIndex: 0.5 })]],
+  ['unlisted slot', [validBringClaim({ itemIndex: 2 })]],
+  ['unsafe slot', [validBringClaim({ itemIndex: Number.MAX_SAFE_INTEGER + 1 })]],
+  ['duplicate slot', [validBringClaim({}), validBringClaim({ id: 'other-offer', memberId: 'river' })]],
+  ['duplicate claim ID', [validBringClaim({}), validBringClaim({ itemIndex: 1 })]],
+]) {
+  test(`malformed existing bring claims preserve the original file: ${label}`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'zaction-invalid-bring-'));
+    try {
+      const filePath = join(directory, 'room.json');
+      let data = createDemoData(NOW);
+      data = createAction(data, 'bring-bbq', { planning: planning() }).data;
+      target(data, 'bring-bbq').bringClaims = claims;
+      const original = JSON.stringify(data, null, 2);
+      await writeFile(filePath, original);
+      assert.throws(() => migrateDemoData(data), /corrupt|unsupported/i);
+      await assert.rejects(createDemoStore({ filePath, now: () => NOW }), /corrupt|unsupported/i);
+      assert.equal(await readFile(filePath, 'utf8'), original, 'corrupt claims are never reset to an empty collection');
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
 test('a rejection is itself idempotent with the original reason and timestamp', () => {
   const data = createDemoData(NOW);
   const invalid = operation(data, { rulesVersion: 'old-rules' });

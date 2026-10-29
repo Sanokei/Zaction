@@ -172,7 +172,7 @@ async function mockWeather(context) {
     await route.fulfill({ status: 200, contentType: 'application/json', headers: { 'cache-control': 'no-store' }, body: JSON.stringify(body) });
   });
 }
-async function fillPlan(page, kind, title, budget = '80') {
+async function fillPlan(page, kind, title, budget = '80', bring = ['A dish to share', 'Water', 'A picnic blanket']) {
   await navigate(page, 'home');
   await page.getByTestId(`template-${kind}`).first().click();
   await page.getByTestId('create-title').fill(title);
@@ -180,13 +180,214 @@ async function fillPlan(page, kind, title, budget = '80') {
   for (const [id, value] of [
     ['plan-date', planDate], ['plan-location', 'Community park; exact meeting point still to be agreed'],
     ['plan-budget', budget], ['plan-people', '8'], ['plan-rainplan', 'Use a free covered space after confirming access, or choose another day.'],
-    ['plan-accessibility', 'Step-free route and a quiet seating option'], ['plan-bringlist', 'A dish to share\nWater\nA picnic blanket'],
+    ['plan-accessibility', 'Step-free route and a quiet seating option'], ['plan-bringlist', bring.join('\n')],
   ]) await page.getByTestId(id).fill(value);
   await page.getByTestId('plan-city').selectOption('new-york');
   if (await page.getByTestId('create-beneficiaries').isVisible()) await page.getByTestId('create-beneficiaries').fill('Neighbors who want to meet and share ideas');
   await page.getByTestId('save-creation').click();
   await eventually(async () => (await local(page)).creationDraft.title === title, 'gathering draft saved');
   return (await local(page)).creationDraft.id;
+}
+
+async function captureBring(page, state, locator = page.getByTestId('bring-items')) {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} bring-item state is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'bring items fit the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-bring-${state}-390x844.png`, fullPage: false });
+  await page.setViewportSize({ width: 1440, height: 1100 });
+}
+
+async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, noahId) {
+  const longItem = 'Reusable plates and a clearly marked allergy-friendly serving kit for everyone';
+  const items = ['Water', 'Water', longItem, 'Cups'];
+  const actionC = await fillPlan(maya, 'bbq', 'Park cookout · bring & share', '80', items);
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === actionC) && !(await local(maya)).pending.length, 'first bring-items plan accepted');
+  const actionD = await fillPlan(maya, 'potluck', 'Covered supper · bring & share', '40', items);
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === actionD) && !(await local(maya)).pending.length, 'second bring-items plan accepted');
+  await foreground(noah);
+  await eventually(async () => (await local(noah)).snapshot.actions.some(action => action.id === actionD), 'second profile sees both bring lists');
+  await select(maya, actionC);
+  await select(noah, actionC);
+  const status = (page, id, index) => page.getByTestId(`bring-status-${id}-${index}`);
+  const row = (page, id, index) => page.getByTestId(`bring-row-${id}-${index}`);
+  const claim = (page, id, index) => page.getByTestId(`bring-claim-${id}-${index}`);
+  const release = (page, id, index) => page.getByTestId(`bring-release-${id}-${index}`);
+  const claims = async (id = actionC) => target(await snapshot(), id).bringClaims ?? [];
+  const sideEffects = room => room.actions.map(action => ({
+    id: action.id, reactions: action.reactions, rsvps: action.rsvps, ballots: action.ballots,
+    contributions: action.contributions, minutes: action.minutes, completedTasks: action.completedTasks, outcome: action.outcome,
+  }));
+  const unrelatedBefore = sideEffects(await snapshot());
+  const progressBefore = { maya: (await local(maya)).progress, noah: (await local(noah)).progress };
+  assert.equal((await claims()).length, 0);
+  assert.equal(await row(maya, actionC, 0).getByText('Water', { exact: true }).count(), 1);
+  assert.equal(await row(maya, actionC, 1).getByText('Water', { exact: true }).count(), 1);
+  const firstName = await claim(maya, actionC, 0).getAttribute('aria-label');
+  const duplicateName = await claim(maya, actionC, 1).getAttribute('aria-label');
+  assert.match(firstName, /Water/);
+  assert.match(duplicateName, /Water/);
+  assert.notEqual(firstName, duplicateName, 'duplicate labels have different accessible slot names');
+  await captureBring(maya, 'open');
+
+  const originalButton = await claim(maya, actionC, 0).elementHandle();
+  await claim(maya, actionC, 0).focus();
+  await maya.keyboard.press('Enter');
+  await eventually(async () => (await claims()).some(item => item.itemIndex === 0 && item.memberId === mayaId) && !(await local(maya)).pending.length, 'Enter offers the first duplicate slot');
+  assert.ok(await originalButton.evaluate(element => element.isConnected && element === document.activeElement), 'the same native button keeps focus after its command becomes release');
+  assert.equal(await originalButton.getAttribute('data-testid'), `bring-release-${actionC}-0`);
+  await foreground(noah);
+  await eventually(async () => /Maya plans to bring/.test(await status(noah, actionC, 0).innerText()), 'other profile sees the actual accepted owner');
+  assert.equal(await release(noah, actionC, 0).count(), 0, 'another member is not offered a release control');
+  await claim(noah, actionC, 1).focus();
+  await noah.keyboard.press('Space');
+  await eventually(async () => (await claims()).some(item => item.itemIndex === 1 && item.memberId === noahId), 'Space offers the second duplicate slot');
+  await select(maya, actionD);
+  await claim(maya, actionD, 0).focus();
+  await maya.keyboard.press('Enter');
+  await eventually(async () => (await claims(actionD)).some(item => item.itemIndex === 0 && item.memberId === mayaId), 'same label in another plan is independent');
+  assert.deepEqual((await claims()).map(item => [item.itemIndex, item.memberId]).sort(), [[0, mayaId], [1, noahId]]);
+  assert.equal((await claims(actionD)).length, 1);
+  await select(maya, actionC);
+  await maya.getByTestId('bring-refresh').focus();
+  await maya.keyboard.press('Enter');
+  await eventually(async () => /Noah plans to bring/.test(await status(maya, actionC, 1).innerText()), 'manual availability refresh reconciles the duplicate slot');
+  assert.ok(await maya.getByTestId('bring-refresh').evaluate(element => element === document.activeElement), 'availability refresh does not steal keyboard focus');
+  await captureBring(maya, 'claimed');
+  await maya.getByTestId('bring-items').evaluate(element => element.scrollIntoView({ block: 'start' }));
+  await maya.screenshot({ path: '/tmp/zaction-bring-claimed-desktop.png', fullPage: false });
+  pass('bring-item native Enter/Space controls preserve focus, distinguish duplicate slots and isolate two plans and real profile owners');
+
+  await mayaContext.setOffline(true);
+  await claim(maya, actionC, 2).click();
+  await eventually(async () => (await local(maya)).pending.filter(op => op.type === 'bring-item' && op.actionId === actionC && op.itemIndex === 2).length === 1, 'offline offer is durably queued once');
+  const pendingClaim = (await local(maya)).pending.find(op => op.type === 'bring-item' && op.itemIndex === 2);
+  assert.equal(pendingClaim.intent, 'claim');
+  assert.equal(pendingClaim.memberId, mayaId);
+  assert.match(await status(maya, actionC, 2).innerText(), /Available/);
+  assert.match(await status(maya, actionC, 2).innerText(), /Offer saved on this device.*waiting to be accepted/s);
+  assert.equal((await claims()).some(item => item.itemIndex === 2), false, 'queued offers do not reserve on the server');
+  const offlineClaimReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok(offlineClaimReload.fromServiceWorker());
+  await eventually(async () => (await local(maya)).pending.some(op => op.id === pendingClaim.id), 'offline offer keeps its original operation ID after worker reload');
+  await captureBring(maya, 'pending-claim', row(maya, actionC, 2));
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => (await claims()).some(item => item.id === pendingClaim.id) && !(await local(maya)).pending.length, 'reconnect accepts the original offer exactly once');
+  assert.equal((await claims()).filter(item => item.itemIndex === 2).length, 1);
+
+  await mayaContext.setOffline(true);
+  await release(maya, actionC, 2).focus();
+  await maya.keyboard.press('Space');
+  await eventually(async () => (await local(maya)).pending.some(op => op.type === 'bring-item' && op.intent === 'release' && op.itemIndex === 2), 'offline release queued');
+  const pendingRelease = (await local(maya)).pending.find(op => op.type === 'bring-item' && op.intent === 'release');
+  assert.equal(pendingRelease.claimId, pendingClaim.id, 'release targets the exact accepted claim');
+  assert.match(await status(maya, actionC, 2).innerText(), /You plan to bring this/);
+  assert.match(await status(maya, actionC, 2).innerText(), /Release saved on this device.*waiting to be accepted/s);
+  assert.equal((await claims()).find(item => item.itemIndex === 2).id, pendingClaim.id, 'queued release does not free accepted ownership');
+  const offlineReleaseReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok(offlineReleaseReload.fromServiceWorker());
+  await eventually(async () => (await local(maya)).pending.some(op => op.id === pendingRelease.id), 'offline release keeps its exact claim and operation IDs');
+  assert.match(await status(maya, actionC, 2).innerText(), /You plan to bring this/);
+  await captureBring(maya, 'pending-release', row(maya, actionC, 2));
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => !(await claims()).some(item => item.itemIndex === 2) && !(await local(maya)).pending.length, 'accepted release frees only the original slot');
+  pass('offline offer and exact-claim release survive real worker reloads without presenting pending intent as accepted availability');
+
+  await foreground(noah);
+  await eventually(async () => !target((await local(noah)).snapshot, actionC).bringClaims.some(item => item.itemIndex === 2), 'both profiles observe the open slot before their competing offers');
+  await Promise.all([mayaContext.setOffline(true), noahContext.setOffline(true)]);
+  await Promise.all([claim(maya, actionC, 2).click(), claim(noah, actionC, 2).click()]);
+  await eventually(async () => [await local(maya), await local(noah)].every(state => state.pending.some(op => op.type === 'bring-item' && op.actionId === actionC && op.itemIndex === 2)), 'both real profiles have competing durable offers');
+  const raceOperations = [await local(maya), await local(noah)].map(state => state.pending.find(op => op.type === 'bring-item' && op.itemIndex === 2));
+  await Promise.all([mayaContext.setOffline(false), noahContext.setOffline(false)]);
+  await Promise.all([foreground(maya), foreground(noah)]);
+  await eventually(async () => !(await local(maya)).pending.length && !(await local(noah)).pending.length, 'both competing offers receive terminal receipts');
+  const raceClaim = (await claims()).filter(item => item.itemIndex === 2);
+  assert.equal(raceClaim.length, 1, 'only one competing offer owns the slot');
+  const winner = raceClaim[0].memberId === mayaId ? maya : noah;
+  const loser = winner === maya ? noah : maya;
+  const loserId = winner === maya ? noahId : mayaId;
+  const rejectedOperation = raceOperations.find(op => op.memberId === loserId);
+  const rejection = (await local(loser)).receipts.find(receipt => receipt.id === rejectedOperation.id);
+  assert.equal(rejection.accepted, false);
+  assert.equal(rejection.operation.itemIndex, 2);
+  assert.equal(rejection.operation.actionId, actionC);
+  assert.match(await status(loser, actionC, 2).innerText(), /Offer not accepted:.*already has an accepted offer/s);
+  await loser.reload({ waitUntil: 'networkidle' });
+  assert.equal((await local(loser)).receipts.find(receipt => receipt.id === rejection.id).accepted, false);
+  assert.match(await status(loser, actionC, 2).innerText(), /Offer not accepted/);
+  await captureBring(loser, 'conflict', row(loser, actionC, 2));
+  await release(winner, actionC, 2).click();
+  await eventually(async () => !(await claims()).some(item => item.itemIndex === 2), 'winner deliberately releases the contested slot');
+  await foreground(loser);
+  await eventually(async () => /Available/.test(await status(loser, actionC, 2).innerText()), 'rejected member reviews refreshed open availability');
+  await claim(loser, actionC, 2).focus();
+  await loser.keyboard.press('Enter');
+  await eventually(async () => (await claims()).some(item => item.itemIndex === 2 && item.memberId === loserId) && !(await local(loser)).pending.length, 'explicit new offer accepted after release');
+  const recovered = (await claims()).find(item => item.itemIndex === 2);
+  assert.notEqual(recovered.id, rejection.id, 'recovery is a deliberate new operation, not a changed replay');
+  assert.equal((await local(loser)).receipts.find(receipt => receipt.id === rejection.id).accepted, false, 'terminal conflict remains in original history');
+  await captureBring(loser, 'recovered', row(loser, actionC, 2));
+  pass('competing offline offers yield one owner, retain the losing intent across reload and require an explicit fresh retry after release');
+
+  const replayIds = [];
+  let dropResponse = true;
+  await mayaContext.route('**/api/operations', async route => {
+    const operation = route.request().postDataJSON();
+    if (operation.type !== 'bring-item' || operation.actionId !== actionC || operation.itemIndex !== 3) return route.continue();
+    replayIds.push(operation.id);
+    if (!dropResponse) return route.continue();
+    await route.fetch(); // The real server commits; only this response is lost.
+    await route.abort('failed');
+  });
+  try {
+    await claim(maya, actionC, 3).click();
+    await eventually(async () => replayIds.length > 0 && (await claims()).some(item => item.itemIndex === 3) && (await local(maya)).pending.some(op => op.id === replayIds[0]), 'real acceptance with lost response leaves the original intent pending');
+    const replayId = replayIds[0];
+    assert.equal((await claims()).find(item => item.itemIndex === 3).id, replayId);
+    await mayaContext.setOffline(true);
+    const lostResponseReload = await maya.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(lostResponseReload.fromServiceWorker());
+    assert.ok((await local(maya)).pending.some(op => op.id === replayId));
+    dropResponse = false;
+    await mayaContext.setOffline(false);
+    await foreground(maya);
+    await eventually(async () => (await local(maya)).receipts.some(receipt => receipt.id === replayId && receipt.accepted) && !(await local(maya)).pending.length, 'lost-response replay retrieves the stable accepted receipt');
+    assert.ok(replayIds.length >= 2, 'the browser retried the operation');
+    assert.equal(new Set(replayIds).size, 1, 'all transport retries preserve the original operation ID');
+    assert.equal((await claims()).filter(item => item.itemIndex === 3).length, 1);
+  } finally { await mayaContext.unroute('**/api/operations'); }
+  pass('a committed bring offer with a lost HTTP response replays the same persisted operation after offline reload and creates exactly one claim');
+
+  const safetyDraft = 'Keep this question and every accepted bring-item owner if a response is corrupt.';
+  await maya.getByTestId('contribution-input').fill(safetyDraft);
+  await maya.getByTestId('save-draft').click();
+  await eventually(async () => (await local(maya)).drafts[actionC]?.discussion === safetyDraft, 'draft persisted before malformed snapshot response');
+  const prior = await local(maya);
+  const malformed = structuredClone(prior.snapshot);
+  malformed.sequence += 1000;
+  target(malformed, actionC).bringClaims.push({ id: 'bad-remote-claim', itemIndex: 999, memberId: 'unregistered-member', createdAt: new Date().toISOString() });
+  await mayaContext.route('**/api/state', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(malformed) }));
+  try {
+    await maya.getByTestId('bring-refresh').click();
+    await maya.getByText('Community updates are unavailable.', { exact: false }).first().waitFor();
+    const kept = await local(maya);
+    assert.deepEqual(kept.snapshot, prior.snapshot, 'invalid remote claim data cannot replace the valid saved room');
+    assert.equal(kept.drafts[actionC].discussion, safetyDraft);
+    assert.equal(kept.identityFingerprint, prior.identityFingerprint);
+  } finally { await mayaContext.unroute('**/api/state'); }
+  await foreground(maya);
+  await eventually(async () => (await local(maya)).snapshot.sequence === (await snapshot()).sequence, 'valid availability reconnects after malformed snapshot rejection');
+  assert.deepEqual(sideEffects(await snapshot()), unrelatedBefore, 'bring offers never set reactions, RSVPs, ballots, comments, minutes, tasks or outcomes');
+  assert.deepEqual({ maya: (await local(maya)).progress, noah: (await local(noah)).progress }, progressBefore, 'bring offers do not award private progress or voting weight');
+  assert.deepEqual(target(await snapshot(), actionD).bringClaims.map(item => [item.itemIndex, item.memberId]), [[0, mayaId]], 'later conflict, retry and release never touch the other plan');
+  pass('malformed bring-claim responses preserve saved work and accepted ownership; logistics leave social signals, votes, progress and other plans unchanged');
 }
 
 try {
@@ -568,6 +769,8 @@ try {
   assert.deepEqual(await local(legacyPage, 'state-v1-backup'), legacy);
   await legacyContext.close();
   pass('legacy browser identity, discussion, progress and exact migration backup survive the community upgrade');
+
+  await verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, noahId);
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept

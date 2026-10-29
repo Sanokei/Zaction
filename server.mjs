@@ -7,7 +7,7 @@ import { randomUUID, randomBytes, createHash } from 'node:crypto';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ACTION_ID = 'reading-circle';
 const MEMBERS = new Set(['alex', 'river', 'jules']);
-const TYPES = new Set(['create-action', 'contribute', 'vote', 'close', 'minutes', 'complete-task', 'react', 'rsvp']);
+const TYPES = new Set(['create-action', 'contribute', 'vote', 'close', 'minutes', 'complete-task', 'react', 'rsvp', 'bring-item']);
 const TASKS = new Set(['accessibility', 'agenda', 'minutes']);
 const CITIES = new Set(['new-york', 'austin', 'seattle', 'chicago', 'los-angeles']);
 const PLAN_KINDS = new Set(['bbq', 'potluck', 'games', 'walk', 'help', 'idea']);
@@ -34,7 +34,7 @@ function createActionRecord(id, input, memberId, now, sourceKind = 'member-provi
     ...input, id, createdBy: memberId, createdAt: timestamp(now), sourceKind,
     proposalRevision: 1, rulesVersion: 'DEMO-RULES-v1', membershipVersion: sourceKind === 'synthetic' ? 'DEMO-MEMBERS-v1' : 'COMMUNITY-PREVIEW-v1',
     closesAt: timestamp(Number(new Date(now)) + 7 * 24 * 60 * 60 * 1000),
-    contributions: [], ballots: [], outcome: 'open', closedAt: null, minutes: [], completedTasks: [], reactions: [], rsvps: [],
+    contributions: [], ballots: [], outcome: 'open', closedAt: null, minutes: [], completedTasks: [], reactions: [], rsvps: [], bringClaims: [],
   };
 }
 
@@ -65,7 +65,7 @@ function validActionRecords(action, memberIds) {
       action.proposalRevision !== 1 || action.rulesVersion !== 'DEMO-RULES-v1' || !MEMBERSHIPS.has(action.membershipVersion) ||
       !Number.isFinite(Date.parse(action.closesAt)) || !['open', 'adopted', 'not-adopted', 'no-quorum'].includes(action.outcome) ||
       !(action.closedAt === null || Number.isFinite(Date.parse(action.closedAt))) ||
-      !['contributions', 'ballots', 'minutes', 'completedTasks', 'reactions', 'rsvps'].every(key => Array.isArray(action[key]))) return false;
+      !['contributions', 'ballots', 'minutes', 'completedTasks', 'reactions', 'rsvps', 'bringClaims'].every(key => Array.isArray(action[key]))) return false;
   const memberRecord = record => object(record) && typeof record.id === 'string' && memberIds.has(record.memberId) && Number.isFinite(Date.parse(record.createdAt));
   const socialRecord = record => object(record) && memberIds.has(record.memberId) && Number.isFinite(Date.parse(record.createdAt));
   if (!action.contributions.every(record => memberRecord(record) && typeof record.text === 'string') ||
@@ -79,6 +79,13 @@ function validActionRecords(action, memberIds) {
       new Set(action.completedTasks.map(task => task.id)).size !== action.completedTasks.length) return false;
   if (action.contributions.some((record, index) => record.parentId !== undefined && !action.contributions.slice(0, index).some(parent => parent.id === record.parentId))) return false;
   if (action.planning !== undefined && validatePlanning(action.planning).error) return false;
+  const slots = action.planning?.bring?.length ?? 0;
+  if (!action.bringClaims.every(claim => object(claim) && operationId(claim.id) && memberIds.has(claim.memberId) &&
+      typeof claim.createdAt === 'string' && Number.isFinite(Date.parse(claim.createdAt)) &&
+      Number.isSafeInteger(claim.itemIndex) && claim.itemIndex >= 0 && claim.itemIndex < slots &&
+      typeof action.planning.bring[claim.itemIndex] === 'string' && action.planning.bring[claim.itemIndex].trim().length > 0) ||
+      new Set(action.bringClaims.map(claim => claim.itemIndex)).size !== action.bringClaims.length ||
+      new Set(action.bringClaims.map(claim => claim.id)).size !== action.bringClaims.length) return false;
   return true;
 }
 
@@ -135,6 +142,7 @@ export function migrateDemoData(input) {
         if (!object(action)) continue;
         if (action.reactions === undefined) { action.reactions = []; enriched = true; }
         if (action.rsvps === undefined) { action.rsvps = []; enriched = true; }
+        if (!Object.hasOwn(action, 'bringClaims')) { action.bringClaims = []; enriched = true; }
       }
     }
     if (data.sessions === undefined) data.sessions = {};
@@ -273,6 +281,22 @@ export function applyOperation(input, operation, now = Date.now()) {
       if (!['going', 'maybe', 'none'].includes(op.status)) return reject('Choose going, maybe, or no RSVP.');
       action.rsvps = action.rsvps.filter(record => record.memberId !== op.memberId);
       if (op.status !== 'none') action.rsvps.push({ memberId: op.memberId, status: op.status, createdAt: receipt.receivedAt });
+    } else if (op.type === 'bring-item') {
+      const slots = action.planning?.bring?.length ?? 0;
+      if (!Number.isSafeInteger(op.itemIndex) || op.itemIndex < 0 || op.itemIndex >= slots) return reject('Choose a listed bring item by its valid item index. No item was changed.');
+      if (!['claim', 'release'].includes(op.intent)) return reject('Choose whether to offer or release this bring item.');
+      const current = action.bringClaims.find(claim => claim.itemIndex === op.itemIndex);
+      if (op.intent === 'claim') {
+        if (op.claimId !== undefined) return reject('A new offer must not include a previous claim ID. Review this item and offer again.');
+        if (current) return reject('This item already has an accepted offer. Review its current owner before trying another available item.');
+        action.bringClaims.push({ id: op.id, itemIndex: op.itemIndex, memberId: op.memberId, createdAt: receipt.receivedAt });
+      } else {
+        if (!operationId(op.claimId)) return reject('A release must name the exact accepted claim ID.');
+        if (!current) return reject('This item has no current offer to release. Review its latest availability.');
+        if (current.memberId !== op.memberId) return reject('Only the current owner can release this bring item.');
+        if (current.id !== op.claimId) return reject('This offer has changed since your release was saved. The newer claim was not removed.');
+        action.bringClaims = action.bringClaims.filter(claim => claim.id !== current.id);
+      }
     }
   }
   receipt.accepted = true;

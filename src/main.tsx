@@ -90,6 +90,7 @@ const acceptedMessages: Record<Operation['type'], string> = {
   'complete-task': 'Task marked complete (self-reported).',
   react: 'Your reaction is shared. It never changes a group vote.',
   rsvp: 'Your RSVP is updated. It is a plan to join, not proof of attendance.',
+  'bring-item': 'Your bring-item choice is shared.',
 };
 
 function templateDraft(cityId: CityId, kind?: GatheringKind): CreationDraft {
@@ -127,7 +128,8 @@ async function synchronize(): Promise<void> {
         };
       });
       if (!saved) break;
-      updateRuntime(receipt.accepted ? (['react', 'rsvp'].includes(pending.type) ? { error: null } : { notice: acceptedMessages[pending.type], error: null }) : { error: `Not accepted: ${receipt.reason}. Your original submission is kept in its history.`, notice: null });
+      // Bring-item feedback stays beside the affected slot, including conflicts.
+      updateRuntime(receipt.accepted ? (['react', 'rsvp', 'bring-item'].includes(pending.type) ? { error: null } : { notice: acceptedMessages[pending.type], error: null }) : pending.type === 'bring-item' ? { notice: null } : { error: `Not accepted: ${receipt.reason}. Your original submission is kept in its history.`, notice: null });
     }
   } catch {
     updateRuntime({ connectivity: navigator.onLine ? 'unavailable' : 'offline' });
@@ -153,11 +155,18 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
     membershipVersion: target?.membershipVersion ?? (MEMBERS.some(member => member.id === local.memberId) ? 'DEMO-MEMBERS-v1' : 'COMMUNITY-PREVIEW-v1'), ...extra,
   };
   updateRuntime({ busy: true, error: null });
-  const saved = await mutate(previous => ({ ...previous, pending: [...previous.pending, operation] }));
-  const announceQueue = !['react', 'rsvp'].includes(type) || runtime.connectivity !== 'online';
+  let duplicate = false;
+  const saved = await mutate(previous => {
+    if (type === 'bring-item' && previous.pending.some(item => item.type === type && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
+      duplicate = true;
+      return previous;
+    }
+    return { ...previous, pending: [...previous.pending, operation] };
+  });
+  const announceQueue = type !== 'bring-item' && (!['react', 'rsvp'].includes(type) || runtime.connectivity !== 'online');
   updateRuntime({ busy: false, ...(saved && announceQueue ? { notice: 'Saved on this device — waiting to sync.' } : {}) });
   if (saved) void synchronize();
-  return saved;
+  return saved && !duplicate;
 }
 
 const actions: Actions = {
@@ -201,6 +210,8 @@ const actions: Actions = {
   },
   async react(actionId, active) { await enqueue('react', actionId, { active }); },
   async rsvp(actionId, status) { await enqueue('rsvp', actionId, { status }); },
+  async claimBringItem(actionId, itemIndex) { return enqueue('bring-item', actionId, { itemIndex, intent: 'claim' }); },
+  async releaseBringItem(actionId, itemIndex, claimId) { return enqueue('bring-item', actionId, { itemIndex, intent: 'release', claimId }); },
   async toggleSave(actionId) {
     if (!validActionId(actionId)) return;
     if (await mutate(previous => ({ ...previous, savedActionIds: (previous.savedActionIds ?? []).includes(actionId) ? previous.savedActionIds!.filter(id => id !== actionId) : [...(previous.savedActionIds ?? []), actionId] }))) updateRuntime({ notice: 'Your saved plans stay private on this device.', error: null });
