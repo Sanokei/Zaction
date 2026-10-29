@@ -1,0 +1,26 @@
+{
+  "name": "zaction",
+  "version": "0.1.0-preview.1",
+  "private": true,
+  "type": "module",
+  "description": "A local-first civic action PWA: small actions, shared power.",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:relay": "PORT=4174 node server.mjs",
+    "build": "tsc --noEmit && vite build && node scripts/build-service-worker.mjs",
+    "start": "node server.mjs",
+    "test": "node --test --test-isolation=none tests/*.test.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "release:package": "node scripts/package-release.mjs"
+  },
+  "dependencies": { "react": "19.3.1", "react-dom": "19.3.1" },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "playwright-core": "1.64.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  }
+}

@@ -1,0 +1,87 @@
+name: Release PWA downloads
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Require the tag to match the package version
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (process.env.GITHUB_REF_NAME !== `v${version}`) {
+            throw new Error('Release tag must match package.json version');
+          }
+          NODE
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright-core install --with-deps chromium
+      - run: npm run test:e2e
+      - run: npm run release:package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-downloads
+          path: |
+            artifacts/zaction-*-web.zip
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-downloads
+          path: artifacts
+      - name: Publish versioned downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            printf 'Release already exists. Use a new version rather than replacing published downloads.\n' >&2
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          A runnable public-demo PWA for a civic action, discussion, equal-weight group vote, and recorded outcome. Personal progress and shared milestones do not increase voting power.
+
+          Download the web ZIP and SHA256SUMS, verify and extract it, then run `node server.mjs` with Node.js 24. Open the locally served site and use the browser's installation menu. Public hosting requires HTTPS and the same-origin demonstration API. The ZIP is a ready-to-host web build, not a native installer.
+
+          Validation: frozen dependency install, domain tests, production build, and Chromium browser flow completed in this release workflow. See the workflow run for the actual checks.
+
+          This is a synthetic public demonstration, not production membership or decentralized voting infrastructure. No on-device GPU/phone validation, Qwen inference, E2EE, or licensed civic-data integration is established by this release. Model downloads are not bundled.
+          NOTES
+          printf '\nSource commit: `%s`\n' "$SOURCE_COMMIT" >> "$RUNNER_TEMP/release-notes.md"
+          release_flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" artifacts/* \
+            --verify-tag --title "Zaction $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${release_flags[@]}"
