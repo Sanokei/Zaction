@@ -69,11 +69,13 @@ jobs:
             exit 1
           fi
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          A runnable public-demo PWA for a civic action, discussion, equal-weight group vote, and recorded outcome. Personal progress and shared milestones do not increase voting power.
+          A runnable public-demo PWA with member-authored $0 actions and proposals, separate discussions and drafts, equal-weight group votes, and recorded outcomes. Personal progress and shared milestones stay scoped to each action and do not increase voting power. Member-provided sources are public and unverified.
+
+          Creation and shared submissions can be saved offline and remain pending until server acceptance. Existing first-preview room and browser data migrate into the multi-action schema without reset; the server preserves a v1 backup before conversion. Read the hosting instructions before upgrading an existing room.
 
           Download the web ZIP and SHA256SUMS, verify and extract it, then run `node server.mjs` with Node.js 24. Open the locally served site and use the browser's installation menu. Public hosting requires HTTPS and the same-origin demonstration API. The ZIP is a ready-to-host web build, not a native installer.
 
-          Validation: frozen dependency install, domain tests, production build, and Chromium browser flow completed in this release workflow. See the workflow run for the actual checks.
+          Validation: frozen dependency install, domain tests, production build, and Chromium browser flows completed for this tagged source in this release workflow. See the workflow run for the actual checks; counts from earlier preview releases are historical evidence only.
 
           This is a synthetic public demonstration, not production membership or decentralized voting infrastructure. No on-device GPU/phone validation, Qwen inference, E2EE, or licensed civic-data integration is established by this release. Model downloads are not bundled.
           NOTES

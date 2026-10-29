@@ -6,7 +6,15 @@ The release ZIP contains `dist/`, `server.mjs`, `package.json`, `LICENSE`, `HOST
 node server.mjs
 ```
 
-Open `http://127.0.0.1:4173`. For a new standalone demo room, set `ZACTION_DATA_FILE` to a new writable filename. The default data path is `.local/demo-room.json`. Stop the server before moving or backing up its data file. Tests use their own temporary files.
+Open `http://127.0.0.1:4173`. For a new standalone demo room, set `ZACTION_DATA_FILE` to a new writable filename. The default data path is `.local/demo-room.json`. Stop the server before moving or backing up its data file. Tests use their own temporary files. The file-backed room is single-process: do not run multiple server instances against the same data file.
+
+## Upgrading from preview.1
+
+The multi-action schema migrates a preview.1 server room automatically on startup. It retains the room ID, the original reading-circle action's contributions, ballots, outcome, minutes, tasks and closing time, and the complete operation/receipt history. Legacy operations and receipts are assigned to `reading-circle` so an old retry does not become an operation against another action.
+
+Before writing the migrated room, the server creates an exclusive backup at `${ZACTION_DATA_FILE}.v1-backup.json` (for the default path, `.local/demo-room.json.v1-backup.json`). It does not overwrite a backup. A different existing backup blocks startup for operator review rather than discarding data. Keep the backup and the current room file when moving an existing room.
+
+Browser storage also migrates the original saved state: the original action's drafts/progress, queued operations, receipts, and local identity are retained, with a legacy-state backup. Previously queued work stays targeted to `reading-circle`; it is not silently applied to a newly selected action. A pending action creation remains unaccepted until the server returns its receipt. No migration resets the room or replaces user input with an empty demo.
 
 ## Configuration
 
@@ -21,7 +29,7 @@ The app expects hosting at the origin root. The Node server supplies the same-or
 
 ## Public hosting
 
-Place the server behind an HTTPS reverse proxy for browser installation on normal domains. Forward requests for the whole origin, including `/api`, and preserve same-origin request behavior. Configure a writable, backed-up demo data path. If a container or proxy requires an externally reachable bind address, set `HOST` intentionally and apply the hosting platform's network controls.
+Place the server behind an HTTPS reverse proxy for browser installation on normal domains. Forward requests for the whole origin, including `/api`, and preserve the original `Host` header: the demo server compares the request `Origin` with `Host` for same-origin write checks. Configure a writable, backed-up demo data path. If a container or proxy requires an externally reachable bind address, set `HOST` intentionally and apply the hosting platform's network controls.
 
 The server is a public demonstration fixture, not a service for real membership, confidential groups, or production ballots. Anyone who can reach it can choose a synthetic persona and exercise demo controls. Use made-up material only. HTTPS protects transport; it does not make group content end-to-end encrypted.
 

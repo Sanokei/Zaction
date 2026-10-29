@@ -1,4 +1,5 @@
 import type { LocalState } from './model';
+import { emptyLocalState, normalizeLocal } from './migrations';
 
 const DATABASE = 'zaction-local-v1';
 let database: Promise<IDBDatabase> | undefined;
@@ -33,13 +34,7 @@ async function read<T>(key: string): Promise<T | undefined> {
 }
 
 export function emptyLocal(): LocalState {
-  return { memberId: null, snapshot: null, draft: '', progress: { read: false, reviewed: false }, pending: [], receipts: [], lastSync: null, identityFingerprint: '' };
-}
-
-function validateLocal(stored: LocalState | undefined) {
-  if (stored && (!Array.isArray(stored.pending) || !Array.isArray(stored.receipts) || typeof stored.draft !== 'string' || !stored.progress)) {
-    throw new Error('Saved data needs review. Your browser data has been preserved.');
-  }
+  return emptyLocalState();
 }
 
 // Read and update in the same transaction so a polling tab cannot replace
@@ -54,9 +49,19 @@ export async function updateLocal(update: (previous: LocalState) => LocalState):
     let failure: unknown;
     request.onsuccess = () => {
       try {
-        validateLocal(request.result);
-        next = update(request.result ? { ...emptyLocal(), ...request.result } : emptyLocal());
-        records.put(next, 'state');
+        const raw = request.result;
+        next = update(normalizeLocal(raw));
+        normalizeLocal(next);
+        if (raw && raw.schemaVersion !== 2) {
+          const backup = records.get('state-v1-backup');
+          backup.onsuccess = () => {
+            if (backup.result !== undefined && JSON.stringify(backup.result) !== JSON.stringify(raw)) {
+              failure = new Error('An existing migration backup differs. Your saved data was preserved for review.'); transaction.abort(); return;
+            }
+            if (backup.result === undefined) records.add(raw, 'state-v1-backup');
+            records.put(next, 'state');
+          };
+        } else records.put(next, 'state');
       } catch (error) { failure = error; transaction.abort(); }
     };
     transaction.oncomplete = () => resolve(next);
@@ -83,8 +88,8 @@ async function identityIfAbsent(candidate: CryptoKeyPair): Promise<CryptoKeyPair
 }
 
 export async function loadLocal(): Promise<LocalState> {
-  const stored = await read<LocalState>('state');
-  validateLocal(stored);
+  const stored = await read<unknown>('state');
+  normalizeLocal(stored);
   // Standard Web Crypto keys stay on this device. The synthetic demo profiles
   // are separate: a device key does not prove a unique human or authorize votes.
   let keys = await read<CryptoKeyPair>('identity');

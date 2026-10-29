@@ -40,7 +40,9 @@ test('production HTTP serves the shell and uncached JSON state separately', asyn
     assert.equal(state.status, 200);
     assert.match(state.headers.get('content-type'), /application\/json/);
     assert.match(state.headers.get('cache-control'), /no-store/);
-    assert.equal((await state.json()).outcome, 'open');
+    const room = await state.json();
+    assert.equal(room.schemaVersion, 2);
+    assert.equal(room.actions.find(action => action.id === 'reading-circle').outcome, 'open');
     const worker = await request('/sw.js');
     assert.equal(worker.status, 200);
     assert.match(worker.headers.get('content-type'), /javascript/);
@@ -80,11 +82,12 @@ test('HTTP API bounds the request body and never exposes files outside dist', as
 test('chunked UTF-8 contributions survive a split inside a multibyte character', async () => {
   await withServer(async ({ request, origin }) => {
     const snapshot = await (await request('/api/state')).json();
+    const action = snapshot.actions.find(action => action.id === 'reading-circle');
     const text = 'Can we add 字幕 and a step-free route? 🌿';
     const body = Buffer.from(JSON.stringify({
-      id: randomUUID(), memberId: 'alex', type: 'contribute', text,
-      roomId: snapshot.roomId, proposalRevision: snapshot.proposalRevision,
-      rulesVersion: snapshot.rulesVersion, membershipVersion: snapshot.membershipVersion,
+      id: randomUUID(), memberId: 'alex', type: 'contribute', text, actionId: action.id,
+      roomId: snapshot.roomId, proposalRevision: action.proposalRevision,
+      rulesVersion: action.rulesVersion, membershipVersion: action.membershipVersion,
     }));
     const split = body.indexOf(Buffer.from('字')) + 1;
     assert.ok(split > 0);
@@ -107,6 +110,6 @@ test('chunked UTF-8 contributions survive a split inside a multibyte character',
     });
     assert.equal(response.status, 200);
     assert.equal(response.body.receipt.accepted, true);
-    assert.equal(response.body.snapshot.contributions[0].text, text);
+    assert.equal(response.body.snapshot.actions.find(action => action.id === 'reading-circle').contributions[0].text, text);
   });
 });

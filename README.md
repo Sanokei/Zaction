@@ -2,9 +2,11 @@
 
 Small actions. Shared power.
 
-Zaction is a youth civic action PWA for learning, contributing, and making group decisions. This first increment is a **public demonstration**: prepare a free school-budget reading circle, add a question, vote on a proposal, and record the outcome and next actions. Personal progress and shared milestones encourage participation without rankings or extra voting power.
+Zaction is a youth civic action PWA for learning, contributing, and making group decisions. This **public demonstration** lets members create their own $0 civic actions and proposals, discuss them, vote, and record outcomes and next steps. A synthetic school-budget reading circle remains as an example. Personal progress and shared milestones encourage participation without rankings or extra voting power.
 
-Original browser-flow screenshots: [desktop home](docs/screenshots/home-desktop.png), [narrow home](docs/screenshots/home-mobile.png), and [narrow proposal/outcome](docs/screenshots/proposal-mobile.png). The desktop capture shows a fresh room; narrow captures show the exercised demo outcome.
+The [multi-action increment and flow](docs/multi-action-flow.md) describes member authoring, action-scoped state, offline recovery, and migration from the first preview. Its local release candidate passed **52 domain/HTTP checks, the production build, and 16 browser-flow checks**. The [current capture set](docs/screenshots/preview2/README.md) shows desktop and original 390×844 open, pending, rejected, input-recovery, saved-recovery, and rejected-submission restoration states. These are browser viewport checks, not actual-phone validation.
+
+The original [desktop home](docs/screenshots/home-desktop.png), [narrow home](docs/screenshots/home-mobile.png), and [narrow proposal/outcome](docs/screenshots/proposal-mobile.png) captures document preview.1; they remain historical evidence for that release.
 
 ## Download and run
 
@@ -21,8 +23,10 @@ The ZIP is a ready-to-host **web build**, not a native phone or desktop installe
 ## Try the demo
 
 - Join as one of three explicitly synthetic members: Alex, River, or Jules. Another browser can join the same server as another demo member.
-- Read the demonstration agenda and save a private draft. Publish a short question or correction when ready.
-- Review the proposal and its demo rules, then approve, oppose, or abstain. Reading or posting first is optional; every eligible demo member has equal voting weight.
+- Open **Create civic action** and draft its title, goal, proposed decision, beneficiaries, tentative time/place, and source label. A source link is optional and must use HTTPS. All member-provided material is public and unverified; the budget stays $0.
+- Save or submit an action while offline. A pending creation is not yet published, and voting starts only after server acceptance. Reconnect or retry to receive an acceptance or rejection; the original draft remains available.
+- Choose an action, read its source card, and save a private discussion draft. Publish a short question or correction when ready. Each action keeps its own discussion, minutes draft, progress, votes, outcome, and tasks.
+- Review that action's proposal and the explicit demo rules, then approve, oppose, or abstain. Reading or posting first is optional; every eligible demo member has equal voting weight in each action.
 - Disconnect after the app has loaded: saved material and drafts remain available. Shared submissions stay pending until the server accepts them on reconnect.
 - Use the labeled demo closing control to inspect an adopted, not-adopted, or no-quorum result. Review and publish minutes, and track the next tasks separately from the decision.
 - Keep a private progress checklist and inspect shared milestones. Participation does not disclose a ballot choice through progress or grant extra influence.
@@ -51,7 +55,7 @@ npm run build
 npm start
 ```
 
-The combined server uses `127.0.0.1:4173` by default. Its demo-room state is local to that server; private progress and drafts are local to each browser. See [hosting and configuration](docs/hosting.md) for data paths, HTTPS, and service dependencies.
+The combined server uses `127.0.0.1:4173` by default. Its demo-room state is local to that server; private progress and action drafts are local to each browser. Existing preview.1 rooms and saved browser work migrate without resetting them. See [hosting and configuration](docs/hosting.md) for migration backups, data paths, HTTPS, and service dependencies.
 
 ## Verify and package
 
@@ -68,7 +72,7 @@ Packaging writes the production ZIP and `SHA256SUMS` under `artifacts/`. It requ
 
 ## Scope and limits
 
-The demo implements the manual action → participation → proposal vote → recorded outcome loop. Official civic links are provided for users to consult directly; opening a link never counts as registration or voting in an official election. Demonstration agendas and people are labeled as synthetic.
+The demo implements member action authoring and the manual action → participation → proposal vote → recorded outcome loop, with explicit action targeting throughout. Sources supplied by members are labeled unverified; a group vote does not verify a claim. Official civic links are provided for users to consult directly; opening a link never counts as registration or voting in an official election. Demonstration agendas and people are labeled as synthetic.
 
 Production membership and anti-duplicate-human checks, decentralized voting finality, Automerge/libp2p sync, encrypted operations, on-device Qwen inference, phone validation, voice, donations, and paid logistics are **not established by this demo**. There is no hidden cloud inference or model download. Group content is not end-to-end encrypted. A service worker caches the app shell; server acceptance still requires connectivity, and uncached first visits cannot work offline.
 
