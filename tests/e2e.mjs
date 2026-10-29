@@ -1184,6 +1184,15 @@ try {
   pass('community feed and decision screens fit the original mobile viewport without uncaught JavaScript errors');
   console.log(`Completed ${passed} community-preview production browser checks. Forecast display used controlled TEST fixtures; no live-provider, phone, GPU, encryption, or official-election validation is claimed.`);
 } catch (error) {
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    // Public annotations expose the failing check/frame without dumping saved
+    // browser state or private test sessions from authenticated page contexts.
+    const firstLine = String(error?.message ?? 'Unknown browser error').split('\n')[0].slice(0, 400);
+    const frames = [...String(error?.stack ?? '').matchAll(/e2e\.mjs:(\d+):(\d+)/g)].slice(0, 3).map(match => `${match[1]}:${match[2]}`).join(', ');
+    const detail = `${error?.name ?? 'Error'} after ${passed} completed checks: ${firstLine}. Test frames: ${frames || 'unavailable'}`;
+    const escaped = detail.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+    console.error(`::error title=Production browser failure::${escaped}`);
+  }
   if (output) console.error('Test server output:', output.trim());
   throw error;
 } finally {
