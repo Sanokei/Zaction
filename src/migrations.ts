@@ -1,4 +1,5 @@
-import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, MEMBERS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt, type PlanChangeContext } from './model';
+import { DEFAULT_ACTION_ID, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, MEMBERS, emptyActionInput, type CivicAction, type LocalState, type DemoSnapshot, type Operation, type Receipt, type PlanChangeContext } from './model.ts';
+import { validSourceRefShape } from '../civic-sources.mjs';
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): value is RecordValue => Boolean(value && typeof value === 'object' && !Array.isArray(value));
@@ -6,7 +7,7 @@ const reservedActionIds = new Set([...Object.getOwnPropertyNames(Object.prototyp
 export const validActionId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value) && !reservedActionIds.has(value);
 const validOperationId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value) && !['__proto__', 'constructor', 'prototype'].includes(value);
 export const validChangeContext = (value: unknown): value is PlanChangeContext => record(value) && validActionId(value.actionId) && (value.expectedChangeId === null || validOperationId(value.expectedChangeId)) && typeof value.reason === 'string' && value.reason.length <= 600;
-const creationDraftValid = (value: unknown) => record(value) && validActionId(value.id) && Object.keys(ACTION_LIMITS).every(key => typeof value[key] === 'string') && (!Object.hasOwn(value, 'change') || validChangeContext(value.change));
+const creationDraftValid = (value: unknown) => record(value) && validActionId(value.id) && Object.keys(ACTION_LIMITS).every(key => typeof value[key] === 'string') && (!Object.hasOwn(value, 'change') || validChangeContext(value.change)) && (!Object.hasOwn(value, 'sourceRef') || validSourceRefShape(value.sourceRef));
 const progressValid = (value: unknown) => record(value) && typeof value.read === 'boolean' && typeof value.reviewed === 'boolean';
 const textDraftValid = (value: unknown) => record(value) && typeof value.discussion === 'string' && typeof value.minutes === 'string';
 const actionStateValid = (value: unknown) => record(value) && value.proposalRevision === 1 && value.rulesVersion === 'DEMO-RULES-v1' && ['DEMO-MEMBERS-v1', 'COMMUNITY-PREVIEW-v1'].includes(String(value.membershipVersion)) && typeof value.closesAt === 'string' && Number.isFinite(Date.parse(value.closesAt)) && ['open', 'adopted', 'not-adopted', 'no-quorum'].includes(String(value.outcome)) && ['contributions', 'ballots', 'minutes', 'completedTasks'].every(key => Array.isArray(value[key]));
@@ -20,6 +21,7 @@ export function parseSnapshot(value: unknown): DemoSnapshot {
     if (!record(item) || !validActionId(item.id) || ids.has(item.id) || !actionStateValid(item) || !Object.keys(ACTION_LIMITS).every(key => typeof item[key] === 'string')) throw new Error('The demo room returned an invalid action. Local work is preserved.');
     ids.add(item.id);
     actions.push(item);
+    if (Object.hasOwn(item, 'sourceRef') && !validSourceRefShape(item.sourceRef)) throw new Error('The plan returned an invalid source reference. Local work is preserved.');
     if (Object.hasOwn(item, 'lifecycle')) {
       const life = item.lifecycle;
       const invalid = () => { throw new Error('The plan returned invalid lifecycle information. Local work is preserved.'); };

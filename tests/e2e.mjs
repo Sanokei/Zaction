@@ -1230,6 +1230,284 @@ async function verifyHelpHandoff() {
   } finally { await helperContext.close(); await organizerContext.close(); }
 }
 
+async function captureLearn(page, state, locator) {
+  const previousViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} Learn/Serve evidence is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'source identity and human-authored questions fit the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-learn-${state}-390x844.png`, fullPage: false });
+  if (previousViewport) await page.setViewportSize(previousViewport);
+}
+
+async function verifyLearnServe() {
+  const sourceRef = { opportunityId: 'nyc-mesh-outreach', snapshotId: '2026-10-29-6760307447a4' };
+  const unknownRef = { opportunityId: 'unknown-outreach', snapshotId: '2026-10-29-unknown' };
+  const authorContext = await newContext({ viewport: { width: 390, height: 844 }, locale: 'en-US' });
+  const readerContext = await newContext({ viewport: { width: 1440, height: 1100 }, locale: 'en-US' });
+  await mockWeather(authorContext);
+  await mockWeather(readerContext);
+  try {
+    const author = await openPage(authorContext);
+    const reader = await openPage(readerContext);
+    await onboard(author, 'Ari', ['help'], 'seattle');
+    await onboard(reader, 'Bo', ['help'], 'austin');
+    const authorId = (await local(author)).memberId;
+    const readerId = (await local(reader)).memberId;
+    await author.getByTestId('learn-entry-feed').focus();
+    await author.keyboard.press('Enter');
+    const source = author.getByTestId('learn-source-card');
+    await source.waitFor();
+    assert.match(await source.getByTestId('source-publisher').innerText(), /NYC Mesh/);
+    assert.match(await source.getByTestId('source-jurisdiction').innerText(), /New York City/);
+    assert.match(await source.innerText(), /community|organization/i);
+    assert.equal((await local(author)).community.cityId, 'seattle', 'source jurisdiction does not infer or overwrite the viewer’s selected city');
+    const reviewedAt = await source.getByTestId('source-reviewed-at').getAttribute('datetime');
+    assert.equal(Date.parse(reviewedAt), Date.parse('2026-10-29T23:12:57.514461Z'));
+    assert.equal(await source.getByTestId('source-guide-link').getAttribute('href'), 'https://www.nycmesh.net/volunteer/');
+    assert.match(await source.getByTestId('source-snapshot-link').getAttribute('href'), /d53de89ba20682d348cc0d4271e64e9875985dcf\/content\/volunteer\/index\.md/);
+    await source.locator('.source-metadata > summary').click();
+    assert.equal(await source.getByTestId('source-opportunity-id').innerText(), sourceRef.opportunityId);
+    assert.equal(await source.getByTestId('source-snapshot-id').innerText(), sourceRef.snapshotId);
+    assert.match(await source.locator('.source-metadata').innerText(), /6760307447a464cf5e6aa4f9b0d9ae82fdf72c5fd99bed2733fa83e8cea10403/);
+    await source.locator('.source-metadata > summary').click();
+    const beforeLink = await local(author);
+    const beforeLinkRoom = await snapshot();
+    const externalRequests = [];
+    for (const testId of ['source-guide-link', 'source-snapshot-link']) {
+      const link = source.getByTestId(testId);
+      const href = await link.getAttribute('href');
+      await authorContext.route(href, async route => {
+        externalRequests.push({ url: route.request().url(), method: route.request().method() });
+        await route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>Controlled handoff test</title><p>Controlled external handoff fixture. No organization form was submitted.</p>' });
+      });
+      const popupPromise = author.waitForEvent('popup');
+      await link.click();
+      const popup = await popupPromise;
+      await popup.waitForLoadState('domcontentloaded');
+      assert.equal(popup.url(), href);
+      await popup.close();
+      await authorContext.unroute(href);
+    }
+    assert.equal(externalRequests.length, 2);
+    assert.ok(externalRequests.every(request => request.method === 'GET'));
+    const afterLink = await local(author);
+    assert.deepEqual(afterLink.progress, beforeLink.progress);
+    assert.deepEqual(afterLink.pending, beforeLink.pending);
+    assert.deepEqual(afterLink.receipts, beforeLink.receipts);
+    assert.deepEqual(afterLink.creationDraft, beforeLink.creationDraft);
+    assert.deepEqual(await snapshot(), beforeLinkRoom, 'external handoffs create no application, signup, attendance, vote or shared mutation');
+    await captureLearn(author, 'source', source);
+    await captureLearn(author, 'source-links', source.locator('.source-links'));
+    await captureLearn(author, 'question-handoff', source.locator('.source-question-handoff'));
+    await author.setViewportSize({ width: 1440, height: 1100 });
+    await source.evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await author.screenshot({ path: '/tmp/zaction-learn-source-desktop.png', fullPage: false });
+    await author.setViewportSize({ width: 390, height: 844 });
+    // A controlled browser clock exercises publisher-local age labels. It does
+    // not change the catalog's successful source review timestamp.
+    await author.clock.setFixedTime(new Date('2026-10-30T02:30:00Z'));
+    await navigate(author, 'profile');
+    await navigate(author, 'learn');
+    await eventually(async () => /Dated source note/i.test(await source.getByTestId('source-freshness').innerText()), 'a new UTC day is still the original publisher-local calendar day');
+    await author.clock.setFixedTime(new Date('2026-10-30T12:00:00Z'));
+    await navigate(author, 'profile');
+    await navigate(author, 'learn');
+    await eventually(async () => /Older source note/i.test(await source.getByTestId('source-freshness').innerText()), 'a later publisher-local calendar day labels the saved note older');
+    assert.equal(await source.getByTestId('source-reviewed-at').getAttribute('datetime'), reviewedAt);
+    await captureLearn(author, 'older-note', source);
+    await authorContext.setOffline(true);
+    const offlineSourceReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(offlineSourceReload.fromServiceWorker());
+    await eventually(async () => /Offline.*source note/i.test(await source.getByTestId('source-freshness').innerText()), 'offline Learn is a bundled source note, not a cached live organization page');
+    assert.equal(await source.getByTestId('source-reviewed-at').getAttribute('datetime'), reviewedAt);
+    await captureLearn(author, 'offline-source', source);
+    await author.clock.setFixedTime(new Date());
+    await authorContext.setOffline(false);
+    await foreground(author);
+    assert.equal(await source.getByTestId('source-reviewed-at').getAttribute('datetime'), reviewedAt, 'reconnect never silently advances source provenance');
+    pass('Learn identifies the publisher, jurisdiction and exact dated snapshot; intercepted external handoffs and older/offline views change no participation or review time');
+
+    const beforeQuestion = await snapshot();
+    await author.getByTestId('start-source-question').click();
+    await author.getByTestId('create-title').waitFor();
+    assert.equal(await author.getByTestId('create-title').inputValue(), '');
+    assert.equal(await author.getByTestId('create-description').inputValue(), '');
+    assert.deepEqual((await local(author)).creationDraft.sourceRef, sourceRef);
+    assert.equal((await snapshot()).actions.length, beforeQuestion.actions.length, 'starting opens only a private blank human composer');
+    await captureLearn(author, 'blank-question', author.locator('.creation-form > h2'));
+    const questionId = (await local(author)).creationDraft.id;
+    const title = 'How could we support NYC Mesh outreach accessibly?';
+    const question = 'I read the saved outreach guide. What should we ask the organization before planning any accessible community contribution?';
+    await author.getByTestId('create-title').fill(title);
+    await author.getByTestId('create-description').fill(question);
+    await author.getByTestId('save-creation').click();
+    await eventually(async () => (await local(author)).creationDraft.title === title && (await local(author)).creationDraft.description === question, 'manual source-linked question durably saved');
+    await authorContext.setOffline(true);
+    await author.getByTestId('publish-action').click();
+    await eventually(async () => (await local(author)).pending.some(op => op.type === 'create-action' && op.actionId === questionId), 'known exact source reference queued only by explicit publication');
+    const knownOperation = (await local(author)).pending.find(op => op.type === 'create-action' && op.actionId === questionId);
+    assert.deepEqual(knownOperation.action.sourceRef, sourceRef);
+    const questionReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(questionReload.fromServiceWorker());
+    assert.deepEqual((await local(author)).creationDraft.sourceRef, sourceRef);
+    assert.equal(await author.getByTestId('create-description').inputValue(), question);
+    await captureLearn(author, 'pending-question', author.getByTestId('creation-pending'));
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === questionId) && !(await local(author)).pending.length, 'source-linked human question accepted once after reconnect');
+    const published = target(await snapshot(), questionId);
+    assert.equal(published.createdBy, authorId);
+    assert.equal(published.sourceKind, 'member-provided');
+    assert.deepEqual(published.sourceRef, sourceRef);
+    assert.deepEqual((await local(author)).receipts.find(receipt => receipt.id === knownOperation.id).operation.action.sourceRef, sourceRef);
+    await navigate(reader, 'learn');
+    await foreground(reader);
+    await reader.getByTestId(`source-discussion-${questionId}`).click();
+    await reader.getByTestId('action-source-context').waitFor();
+    const correction = 'The saved guide may be older than current onboarding. Could outreach be remote, and what should we confirm directly with NYC Mesh?';
+    await reader.getByTestId('contribution-input').fill(correction);
+    await reader.getByTestId('publish-contribution').click();
+    await eventually(async () => target(await snapshot(), questionId).contributions.some(comment => comment.text === correction && comment.memberId === readerId), 'another profile can discuss a possible source correction');
+    assert.deepEqual(target(await snapshot(), questionId).sourceRef, sourceRef);
+    assert.equal(await reader.getByTestId('action-source-context').getByTestId('source-reviewed-at').getAttribute('datetime'), reviewedAt);
+    await captureLearn(reader, 'member-correction', reader.locator('.comment-list').locator('..'));
+    await select(author, questionId);
+    await author.getByTestId(`plan-update-${questionId}`).click();
+    await author.getByTestId('create-title').fill('A revised community question about accessible outreach');
+    await author.getByTestId('change-reason').fill('Clarify our question after discussion; the dated organization reference itself is unchanged.');
+    await author.getByTestId('save-plan-change').click();
+    await eventually(async () => Boolean((await local(author)).planChangeDrafts[questionId]?.change.reason), 'human revision saved separately');
+    const successorId = (await local(author)).planChangeDrafts[questionId].id;
+    assert.deepEqual((await local(author)).planChangeDrafts[questionId].sourceRef, sourceRef);
+    await author.getByTestId('publish-plan-change').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === successorId) && !(await local(author)).pending.length, 'revised question accepted as a fresh linked plan');
+    assert.deepEqual(target(await snapshot(), questionId).sourceRef, sourceRef);
+    assert.deepEqual(target(await snapshot(), successorId).sourceRef, sourceRef);
+    assert.equal(target(await snapshot(), questionId).contributions[0].text, correction);
+    await select(author, successorId);
+    await captureLearn(author, 'member-discussion', author.getByTestId('action-source-context'));
+    pass('a blank human-authored question preserves the exact source through offline publication, another profile’s correction and a separate linked revision');
+
+    const beforeFailedStart = (await local(author)).creationDraft;
+    await navigate(author, 'learn');
+    await author.evaluate(() => {
+      const original = IDBObjectStore.prototype.put;
+      window.__restoreLearnPut = () => { IDBObjectStore.prototype.put = original; };
+      IDBObjectStore.prototype.put = function () { throw new DOMException('Controlled source-draft storage failure', 'QuotaExceededError'); };
+    });
+    try {
+      await author.getByTestId('start-source-question').click();
+      await author.getByRole('alert').first().waitFor();
+      assert.deepEqual((await local(author)).creationDraft, beforeFailedStart, 'a failed preparation does not replace saved work or claim it is ready');
+    } finally { await author.evaluate(() => window.__restoreLearnPut()); }
+    await author.getByTestId('start-source-question').click();
+    await author.getByTestId('create-title').waitFor();
+    const privateId = (await local(author)).creationDraft.id;
+    const privateTitle = 'A private question kept between source visits';
+    const privateBody = 'Keep this manually written question private while I compare the source and decide what to ask.';
+    await author.getByTestId('create-title').fill(privateTitle);
+    await author.getByTestId('create-description').fill(privateBody);
+    await author.getByTestId('save-creation').click();
+    await eventually(async () => (await local(author)).creationDraft.description === privateBody, 'same-source private question saved');
+    await navigate(author, 'learn');
+    await author.getByTestId('start-source-question').click();
+    await author.getByTestId('create-title').waitFor();
+    assert.equal((await local(author)).creationDraft.id, privateId);
+    assert.equal(await author.getByTestId('create-title').inputValue(), privateTitle);
+    assert.equal(await author.getByTestId('create-description').inputValue(), privateBody);
+    await author.getByTestId('remove-source-reference').click();
+    await eventually(async () => !Object.hasOwn((await local(author)).creationDraft, 'sourceRef'), 'source removal is an explicit private edit');
+    await author.getByTestId('create-title').fill('Unfinished neighborhood game-night question');
+    await author.getByTestId('save-creation').click();
+    await eventually(async () => (await local(author)).creationDraft.title === 'Unfinished neighborhood game-night question', 'unrelated draft saved');
+    const unrelatedDraft = structuredClone((await local(author)).creationDraft);
+    await select(author, successorId);
+    await author.getByTestId('contribution-input').fill('Preserve this private discussion question while I review a different source.');
+    await author.getByTestId('save-draft').click();
+    await eventually(async () => (await local(author)).drafts[successorId]?.discussion.startsWith('Preserve this private'), 'independent discussion draft saved');
+    await author.getByTestId(`plan-update-${successorId}`).click();
+    await author.getByTestId('create-title').fill('A separate private change proposal');
+    await author.getByTestId('change-reason').fill('Keep this revision private until the current arrangements are reviewed.');
+    await author.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(author)).planChangeDrafts[successorId]?.title === 'A separate private change proposal', 'independent change draft saved');
+    const otherDrafts = { discussion: structuredClone((await local(author)).drafts), changes: structuredClone((await local(author)).planChangeDrafts) };
+    await navigate(author, 'learn');
+    await author.getByTestId('start-source-question').click();
+    await author.getByTestId('source-draft-conflict').waitFor();
+    assert.deepEqual((await local(author)).creationDraft, unrelatedDraft);
+    assert.deepEqual((await local(author)).drafts, otherDrafts.discussion);
+    assert.deepEqual((await local(author)).planChangeDrafts, otherDrafts.changes);
+    await captureLearn(author, 'draft-preserved', author.getByTestId('source-draft-conflict'));
+    await author.getByTestId('open-existing-draft').click();
+    assert.equal(await author.getByTestId('create-title').inputValue(), unrelatedDraft.title);
+    assert.equal(await author.getByTestId('create-description').inputValue(), privateBody);
+    pass('source starts resume only the same draft, handle storage failure honestly and preserve unrelated creation, discussion and change work');
+
+    await authorContext.setOffline(true);
+    const beforeUnknown = await local(author);
+    const unknownDraft = { ...beforeUnknown.creationDraft, sourceRef: unknownRef };
+    await saveBrowserRecord(author, { ...beforeUnknown, creationDraft: unknownDraft });
+    const unknownReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(unknownReload.fromServiceWorker());
+    const unknownContext = author.getByTestId('draft-source-context');
+    await unknownContext.getByTestId('source-unavailable').waitFor();
+    assert.match(await unknownContext.innerText(), /unknown-outreach/);
+    assert.match(await unknownContext.innerText(), /2026-10-29-unknown/);
+    assert.equal(await unknownContext.locator('a[href]').count(), 0, 'unknown exact identities never inherit links from the current source');
+    await author.getByTestId('publish-action').click();
+    assert.deepEqual((await local(author)).creationDraft, unknownDraft);
+    assert.equal((await local(author)).pending.length, 0, 'a locally unknown reference does not claim successful queueing');
+    await captureLearn(author, 'unknown-source', unknownContext);
+    const malformed = structuredClone(beforeUnknown.snapshot);
+    malformed.sequence += 1;
+    target(malformed, successorId).sourceRef = { opportunityId: 7, snapshotId: sourceRef.snapshotId };
+    await authorContext.route('**/api/state', route => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(malformed) }));
+    await authorContext.setOffline(false);
+    await foreground(author);
+    try {
+      await author.getByText('Community updates are unavailable.', { exact: false }).first().waitFor();
+      assert.deepEqual((await local(author)).snapshot, beforeUnknown.snapshot, 'malformed incoming provenance cannot overwrite a valid saved room');
+      assert.deepEqual((await local(author)).creationDraft, unknownDraft);
+    } finally { await authorContext.unroute('**/api/state'); }
+    await authorContext.setOffline(true);
+    const validInput = structuredClone(knownOperation.action);
+    const cachedId = randomUUID();
+    const cachedInput = { ...validInput, title: 'A cached question needing source review', description: 'This manually written question must remain here if the server cannot recognize its old source snapshot.', sourceRef: unknownRef };
+    const cachedDraft = { ...cachedInput, id: cachedId };
+    const cachedOperation = { ...knownOperation, id: randomUUID(), actionId: cachedId, action: cachedInput };
+    await saveBrowserRecord(author, { ...(await local(author)), creationDraft: cachedDraft, pending: [cachedOperation] });
+    await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.deepEqual((await local(author)).pending[0].action.sourceRef, unknownRef);
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await eventually(async () => !(await local(author)).pending.length && (await local(author)).receipts.some(receipt => receipt.id === cachedOperation.id && !receipt.accepted), 'an older cached unknown-source submission receives a terminal server rejection');
+    const rejected = (await local(author)).receipts.find(receipt => receipt.id === cachedOperation.id);
+    assert.deepEqual(rejected.operation.action, cachedInput);
+    assert.deepEqual((await local(author)).creationDraft, cachedDraft);
+    assert.equal((await snapshot()).actions.some(action => action.id === cachedId), false);
+    await author.reload({ waitUntil: 'networkidle' });
+    assert.deepEqual((await local(author)).receipts.find(receipt => receipt.id === cachedOperation.id).operation.action.sourceRef, unknownRef);
+    await captureLearn(author, 'rejected-source', author.getByTestId('creation-rejected'));
+    await author.getByTestId('remove-source-reference').focus();
+    await author.keyboard.press('Enter');
+    await eventually(async () => !Object.hasOwn((await local(author)).creationDraft, 'sourceRef'), 'unknown reference removed only by explicit user action');
+    assert.equal(await author.getByTestId('create-title').inputValue(), cachedInput.title);
+    assert.equal(await author.getByTestId('create-description').inputValue(), cachedInput.description);
+    await captureLearn(author, 'source-recovery', author.locator('.creation-form'));
+    await author.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === cachedId) && !(await local(author)).pending.length, 'reviewed text can be explicitly published without an unavailable source reference');
+    assert.equal(Object.hasOwn(target(await snapshot(), cachedId), 'sourceRef'), false);
+    assert.equal((await local(author)).receipts.find(receipt => receipt.id === cachedOperation.id).accepted, false);
+    assert.deepEqual((await local(author)).progress, beforeLink.progress, 'reading, linking, discussing and source recovery award no private progress or ballot weight');
+    assert.deepEqual(pageErrors, []);
+    pass('unknown and malformed source identities preserve work; an offline legacy rejection retains its original payload until explicit source removal and reviewed publication');
+  } finally { await readerContext.close(); await authorContext.close(); }
+}
+
 try {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(`Server exited: ${output}`);
@@ -1241,6 +1519,9 @@ try {
   if (process.env.ZACTION_E2E_SCOPE === 'help') {
     await verifyHelpHandoff();
     console.log(`Completed ${passed} focused help handoff production browser checks.`);
+  } else if (process.env.ZACTION_E2E_SCOPE === 'learn') {
+    await verifyLearnServe();
+    console.log(`Completed ${passed} focused Learn/Serve production browser checks.`);
   } else {
   const mayaContext = await newContext({ viewport: { width: 390, height: 844 } });
   const noahContext = await newContext({ viewport: { width: 1440, height: 1100 } });
@@ -1625,6 +1906,7 @@ try {
   await verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext, noahId);
   await verifyScheduleWeather(maya);
   await verifyHelpHandoff();
+  await verifyLearnServe();
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept

@@ -1,6 +1,6 @@
 # Hosting and installation
 
-The release ZIP contains `dist/`, `server.mjs`, its `weather.mjs` provider adapter, `package.json`, `LICENSE`, `HOSTING.md`, and `RELEASE.json`. It is a web application distribution; Node.js 24.5+ can serve the app and its public preview API without installing npm packages. The production assets include self-hosted Bricolage Grotesque WOFF2 files and `dist/fonts/Bricolage-Grotesque-OFL.txt`; no font CDN is required.
+The release ZIP contains `dist/`, `server.mjs`, its `weather.mjs` provider adapter, the shared `civic-sources.mjs` catalog, `package.json`, `LICENSE`, `HOSTING.md`, and `RELEASE.json`. It is a web application distribution; Node.js 24.5+ can serve the app and its public preview API without installing npm packages. The production assets include self-hosted Bricolage Grotesque WOFF2 files and `dist/fonts/Bricolage-Grotesque-OFL.txt`; no font CDN is required.
 
 ```bash
 node --use-env-proxy server.mjs
@@ -51,6 +51,14 @@ Cancellation similarly requires the author, current lifecycle token, and explici
 Offline author drafts and operations retain their original target, lifecycle token, reason, and stable operation ID. While pending, the public original stays unchanged. A race or stale token produces a concrete rejection; a new attempt requires deliberate review rather than automatic rebasing. Stable-ID replay cannot create a duplicate successor.
 
 Superseded/cancelled plans reject new participation against their original IDs instead of silently moving it to the successor. The exact owner may still release the exact current bring-item claim on that original inactive plan. A release does not move the offer to a fresh plan or establish delivery. These controls use existing pseudonymous preview ownership, not new production authentication, group authority, notifications, payment, or location tracking.
+
+## Dated Learn & serve sources
+
+Keep `civic-sources.mjs` beside `server.mjs` in the extracted runtime: the server imports it, and the client bundles the same append-only curated catalog. This release adds one NYC Mesh outreach/design note for New York City. NYC Mesh is a community-network organization, not government or an election authority. The exact publisher-maintained [guide snapshot](https://github.com/nycmeshnet/nycmesh.net/blob/d53de89ba20682d348cc0d4271e64e9875985dcf/content/volunteer/index.md) returned HTTP 200 at `2026-10-29T23:12:57.514461Z`, body SHA-256 `6760307447a464cf5e6aa4f9b0d9ae82fdf72c5fd99bed2733fa83e8cea10403`. The separate canonical website check at `2026-10-29T23:13:25.939411Z` failed with proxy CONNECT 403; a successful source-snapshot read does not establish live-site access. See the [source and scope record](learn-serve-increment.md).
+
+The optional `sourceRef` is the exact `{opportunityId, snapshotId}` pair. New publications must resolve a known snapshot. Existing records without it remain unchanged; well-shaped unknown references are preserved and shown as unavailable rather than replaced with the newest entry. Malformed incoming/stored references fail validation while existing work is retained. Published snapshots must remain append-only so older plans, queued operations, rejected receipts, successors, and original history retain their exact meaning. No room reset or schema-version migration is required.
+
+The saved note works with the loaded offline app; it is a summary, not an offline copy of the organization’s website. Older/offline labels use the publisher’s New York calendar and do not claim a legal expiry. Page opens, sync, reconnect, and external clicks never advance the recorded review date. There is no live-source checker, organization submission, signup, eligibility/placement guarantee, or automatic progress. Starting a question uses the existing private composer, preserves unrelated unfinished work, and still requires the member’s review/publication. Community questions and corrections remain public, unverified member content; votes and practical offers stay separate.
 
 ## Configuration
 

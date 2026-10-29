@@ -3,6 +3,7 @@ import { readFile, writeFile, rename, mkdir, stat } from 'node:fs/promises';
 import { resolve, dirname, extname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
+import { validSourceRefShape, validKnownSourceRef } from './civic-sources.mjs';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ACTION_ID = 'reading-circle';
@@ -68,6 +69,7 @@ function validActionRecords(action, memberIds) {
       !Number.isFinite(Date.parse(action.closesAt)) || !['open', 'adopted', 'not-adopted', 'no-quorum'].includes(action.outcome) ||
       !(action.closedAt === null || Number.isFinite(Date.parse(action.closedAt))) ||
       !['contributions', 'ballots', 'minutes', 'completedTasks', 'reactions', 'rsvps', 'bringClaims'].every(key => Array.isArray(action[key]))) return false;
+  if (Object.hasOwn(action, 'sourceRef') && !validSourceRefShape(action.sourceRef)) return false;
   const memberRecord = record => object(record) && typeof record.id === 'string' && memberIds.has(record.memberId) && Number.isFinite(Date.parse(record.createdAt));
   const socialRecord = record => object(record) && memberIds.has(record.memberId) && Number.isFinite(Date.parse(record.createdAt));
   if (!action.contributions.every(record => memberRecord(record) && typeof record.text === 'string') ||
@@ -216,7 +218,7 @@ function finalizeExpired(snapshot, now) {
 }
 
 function validateActionInput(input) {
-  if (!object(input) || Object.keys(input).some(key => !Object.hasOwn(ACTION_FIELDS, key) && key !== 'planning')) return { error: 'Use only the supported action fields. A top-level budget or payment is not supported; planning estimates belong in planning.budgetCents.' };
+  if (!object(input) || Object.keys(input).some(key => !Object.hasOwn(ACTION_FIELDS, key) && !['planning', 'sourceRef'].includes(key))) return { error: 'Use only the supported action fields. A top-level budget or payment is not supported; planning estimates belong in planning.budgetCents.' };
   const normalized = {};
   for (const [key, [minimum, maximum]] of Object.entries(ACTION_FIELDS)) {
     const raw = input[key] === undefined && minimum === 0 ? '' : input[key];
@@ -230,6 +232,11 @@ function validateActionInput(input) {
       const source = new URL(normalized.sourceUrl);
       if (source.protocol !== 'https:' || !source.hostname || source.username || source.password) throw new Error('Unsupported URL.');
     } catch { return { error: 'A source URL must use HTTPS and must not include a username or password.' }; }
+  }
+  if (Object.hasOwn(input, 'sourceRef')) {
+    if (!validSourceRefShape(input.sourceRef)) return { error: 'Use an exact saved source reference with only an opportunity ID and snapshot ID.' };
+    if (!validKnownSourceRef(input.sourceRef)) return { error: 'This saved source snapshot is unavailable in this version. Keep your draft and review the source, or remove its reference before trying again.' };
+    normalized.sourceRef = { opportunityId: input.sourceRef.opportunityId, snapshotId: input.sourceRef.snapshotId };
   }
   if (input.planning !== undefined) {
     const planning = validatePlanning(input.planning);

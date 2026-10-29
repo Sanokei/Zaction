@@ -6,6 +6,7 @@ import './styles.css';
 import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, lifecycleFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
 import { emptyLocal, loadLocal, loadCommunitySession, updateLocal, type SessionChange } from './store';
 import { parseSnapshot, validActionId, validChangeContext } from './migrations';
+import { sourceFor, validSourceRefShape } from '../civic-sources.mjs';
 
 const root = createRoot(document.getElementById('root')!);
 let local: LocalState = emptyLocal();
@@ -175,6 +176,12 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
 function inputForDraft(draft: CreationDraft): ActionInput | null {
   const input = Object.fromEntries(Object.keys(ACTION_LIMITS).map(field => [field, String(draft[field as keyof CreationDraft]).trim()])) as unknown as ActionInput;
   if (draft.planning) input.planning = structuredClone(draft.planning);
+  if (Object.hasOwn(draft, 'sourceRef')) {
+    if (!validSourceRefShape(draft.sourceRef) || !sourceFor(draft.sourceRef)) {
+      updateRuntime({ error: 'This exact source reference is unavailable in this app version. Your draft is kept. Review the reference or remove it deliberately before sharing.' }); return null;
+    }
+    input.sourceRef = { ...draft.sourceRef };
+  }
   if (input.title.length < 3 || input.description.length < 10 || input.proposalTitle.length < 3 || input.beneficiaries.length < 3) {
     updateRuntime({ error: 'Add an action title, a description of at least 10 characters, a proposal title, and who benefits. Your draft is saved.' }); return null;
   }
@@ -290,6 +297,26 @@ const actions: Actions = {
     })) return;
     actions.navigate('create');
   },
+  async startSourceDiscussion(sourceRef) {
+    const source = sourceFor(sourceRef);
+    if (!source) { updateRuntime({ error: 'This exact source snapshot is unavailable. No draft or source was replaced.' }); return 'failed'; }
+    let conflict = false;
+    const saved = await mutate(previous => {
+      const current = previous.creationDraft;
+      const alreadyPublished = previous.snapshot?.actions.some(action => action.id === current.id);
+      const sameReference = current.sourceRef?.opportunityId === sourceRef.opportunityId && current.sourceRef?.snapshotId === sourceRef.snapshotId;
+      if (!alreadyPublished && sameReference) return previous;
+      // Treat changed planning fields as real work even when the title is empty.
+      const blankPlanning = !current.planning || JSON.stringify(current.planning) === JSON.stringify(emptyPlanning(communityFor(previous).cityId));
+      const empty = !current.change && !Object.hasOwn(current, 'sourceRef') && Object.keys(ACTION_LIMITS).every(key => !current[key as keyof ActionInput]?.toString().trim()) && blankPlanning;
+      if (!alreadyPublished && !empty) { conflict = true; return previous; }
+      return { ...previous, creationDraft: { id: alreadyPublished ? crypto.randomUUID() : current.id, ...emptyActionInput(), planning: emptyPlanning(source.cityId, 'idea'), sourceRef: { ...source.ref } } };
+    });
+    if (!saved) return 'failed';
+    if (conflict) return 'conflict';
+    actions.navigate('create');
+    return 'opened';
+  },
   async createAction(draft) {
     if (draft.change) { updateRuntime({ error: 'This is a change draft. Share it through the original plan’s review so its history stays linked.' }); return false; }
     if (!await actions.saveCreationDraft(draft)) return false;
@@ -305,6 +332,7 @@ const actions: Actions = {
     if (!source) return false;
     const fields = Object.fromEntries(Object.keys(ACTION_LIMITS).map(key => [key, source[key as keyof ActionInput]])) as unknown as ActionInput;
     if (source.planning) fields.planning = structuredClone(source.planning);
+    if (source.sourceRef) fields.sourceRef = { ...source.sourceRef };
     const draft: CreationDraft = { id: crypto.randomUUID(), ...fields, change: { actionId, expectedChangeId: lifecycleFor(source).changeId, reason: '' } };
     const saved = await mutate(previous => ({ ...previous, selectedActionId: actionId, planChangeDrafts: { ...previous.planChangeDrafts, [actionId]: previous.planChangeDrafts?.[actionId] ?? draft } }));
     if (saved) { activeActionId = actionId; actions.navigate('edit'); }

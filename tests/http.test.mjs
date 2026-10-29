@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
@@ -14,7 +14,8 @@ async function withServer(run) {
   await writeFile(join(distDir, 'index.html'), '<!doctype html><title>Zaction test shell</title>');
   await writeFile(join(distDir, 'sw.js'), '/* worker fixture */');
   await writeFile(join(directory, 'outside.txt'), 'OUTSIDE_ROOT_PRIVATE_SENTINEL');
-  const store = await createDemoStore({ filePath: join(directory, 'room.json') });
+  const filePath = join(directory, 'room.json');
+  const store = await createDemoStore({ filePath });
   const server = createAppServer({ store, distDir });
   try {
     await new Promise((resolve, reject) => {
@@ -23,7 +24,7 @@ async function withServer(run) {
     });
     const origin = `http://127.0.0.1:${server.address().port}`;
     const request = (path, options = {}) => fetch(origin + path, { ...options, signal: AbortSignal.timeout(5000) });
-    await run({ request, origin, store });
+    await run({ request, origin, store, filePath });
   } finally {
     await new Promise(resolve => server.close(resolve));
     await rm(directory, { recursive: true, force: true });
@@ -450,5 +451,76 @@ test('author cancel-versus-change requests with the same lifecycle token have ex
     assert.equal(synthetic.status, 200);
     assert.equal(synthetic.receipt.accepted, false);
     assert.equal(synthetic.snapshot.actions.find(action => action.id === 'reading-circle').lifecycle.status, 'active');
+  });
+});
+
+test('curated source references survive authenticated HTTP publication, immutable retries, and rejected-payload restart', async () => {
+  await withServer(async ({ request, filePath }) => {
+    const joined = await request('/api/community/join', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Maya', cityId: 'new-york' }),
+    });
+    assert.equal(joined.status, 200);
+    const member = await joined.json();
+    const sourceRef = { opportunityId: 'nyc-mesh-outreach', snapshotId: '2026-10-29-6760307447a4' };
+    const sourceAction = {
+      title: 'Bring an outreach question back to the group',
+      description: 'What should our group ask about nontechnical outreach with NYC Mesh?',
+      proposalTitle: 'Discuss an outreach question together', beneficiaries: 'Neighbors interested in community networking',
+      whenWhere: 'Details to be agreed', sourceLabel: 'NYC Mesh volunteer guide — a member question',
+      sourceUrl: 'https://www.nycmesh.net/volunteer/', sourceRef,
+    };
+    const operation = {
+      id: randomUUID(), actionId: 'mesh-source-question', type: 'create-action', memberId: member.profile.id,
+      roomId: member.snapshot.roomId, proposalRevision: 1, rulesVersion: 'DEMO-RULES-v1',
+      membershipVersion: 'COMMUNITY-PREVIEW-v1', action: sourceAction,
+    };
+    const send = async op => {
+      const response = await request('/api/operations', {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${member.token}` },
+        body: JSON.stringify(op),
+      });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const accepted = await send(operation);
+    assert.equal(accepted.receipt.accepted, true);
+    const readPublished = async () => (await (await request('/api/state')).json()).actions.find(action => action.id === operation.actionId);
+    const published = await readPublished();
+    assert.deepEqual(published.sourceRef, sourceRef);
+    assert.equal(published.sourceKind, 'member-provided', 'a curated reference does not turn the member’s question into an official assertion');
+    assert.equal(published.sourceLabel, sourceAction.sourceLabel);
+    assert.equal(published.sourceUrl, sourceAction.sourceUrl);
+    const unknownRef = { ...sourceRef, snapshotId: '2026-10-29-000000000000' };
+    const tampered = await send({ ...operation, action: { ...sourceAction, sourceRef: unknownRef } });
+    assert.equal(tampered.receipt.accepted, false, 'an accepted operation ID cannot be reused with another nested source snapshot');
+    assert.deepEqual((await readPublished()).sourceRef, sourceRef);
+    const replay = await send(operation);
+    assert.deepEqual(replay.receipt, accepted.receipt);
+    assert.equal(replay.snapshot.actions.filter(action => action.id === operation.actionId).length, 1);
+    const unknownCreate = { ...operation, id: randomUUID(), actionId: 'unlisted-source-question', action: { ...sourceAction, sourceRef: unknownRef } };
+    const rejectedUnknown = await send(unknownCreate);
+    assert.equal(rejectedUnknown.receipt.accepted, false);
+    assert.equal(rejectedUnknown.snapshot.actions.some(action => action.id === unknownCreate.actionId), false);
+    const malformedChange = {
+      ...operation, id: randomUUID(), type: 'change-plan', replacementActionId: 'malformed-source-successor',
+      expectedChangeId: null, changeReason: 'Review a separate proposal with its source kept explicit.',
+      action: { ...sourceAction, sourceRef: null },
+    };
+    const rejectedMalformed = await send(malformedChange);
+    assert.equal(rejectedMalformed.receipt.accepted, false);
+    assert.equal(rejectedMalformed.snapshot.actions.some(action => action.id === malformedChange.replacementActionId), false);
+    assert.equal((await readPublished()).lifecycle.status, 'active');
+    assert.deepEqual((await readPublished()).sourceRef, sourceRef);
+    const disk = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.deepEqual(disk.receipts[operation.id].operation, operation, 'tampered retries never replace the stored original publication payload');
+    assert.deepEqual(disk.receipts[unknownCreate.id].operation, unknownCreate);
+    assert.deepEqual(disk.receipts[malformedChange.id].operation, malformedChange);
+    const restored = await createDemoStore({ filePath });
+    assert.equal(await restored.authorized(member.profile.id, member.token), true);
+    assert.deepEqual((await restored.submit(operation)).receipt, accepted.receipt);
+    assert.deepEqual((await restored.submit(unknownCreate)).receipt, rejectedUnknown.receipt);
+    assert.deepEqual((await restored.submit(malformedChange)).receipt, rejectedMalformed.receipt);
+    assert.deepEqual((await restored.getState()).actions.find(action => action.id === operation.actionId).sourceRef, sourceRef);
   });
 });

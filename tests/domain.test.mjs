@@ -36,6 +36,7 @@ const authored = (fields = {}) => ({
   sourceUrl: 'https://example.org/library-access',
   ...fields,
 });
+const CURATED_SOURCE_REF = Object.freeze({ opportunityId: 'nyc-mesh-outreach', snapshotId: '2026-10-29-6760307447a4' });
 function createAction(data, actionId = 'library-access', fields = {}, now = NOW) {
   return applyOperation(data, operation(data, { type: 'create-action', actionId, action: authored(fields) }), now);
 }
@@ -498,6 +499,137 @@ test('a member-authored action is validated, source-labeled, and created exactly
   const anotherID = applyOperation(replay.data, { ...op, id: randomUUID() }, NOW + 2);
   assert.equal(anotherID.receipt.accepted, false);
   assert.equal(anotherID.snapshot.actions.length, 2);
+});
+
+test('a dated source reference stays member-authored and immutable through canonical operation replay', () => {
+  const initial = createDemoData(NOW);
+  const request = operation(initial, { type: 'create-action', actionId: 'source-question', action: authored({ sourceRef: { ...CURATED_SOURCE_REF } }) });
+  const created = applyOperation(initial, request, NOW);
+  assert.equal(created.receipt.accepted, true);
+  const action = target(created.snapshot, request.actionId);
+  assert.deepEqual(action.sourceRef, CURATED_SOURCE_REF);
+  assert.equal(action.sourceKind, 'member-provided', 'a publisher reference does not make the authored plan official');
+  assert.deepEqual(action.contributions, []);
+  assert.deepEqual(action.ballots, []);
+  const reordered = { ...request, action: { ...request.action, sourceRef: { snapshotId: CURATED_SOURCE_REF.snapshotId, opportunityId: CURATED_SOURCE_REF.opportunityId } } };
+  const replay = applyOperation(created.data, reordered, NOW + 1);
+  assert.deepEqual(replay.receipt, created.receipt);
+  assert.equal(replay.snapshot.sequence, created.snapshot.sequence);
+  const altered = applyOperation(replay.data, { ...request, action: { ...request.action, sourceRef: { ...CURATED_SOURCE_REF, snapshotId: 'different-snapshot' } } }, NOW + 2);
+  assert.equal(altered.receipt.accepted, false);
+  assert.deepEqual(target(altered.snapshot, request.actionId), action);
+  assert.deepEqual(altered.data.receipts[request.id], created.data.receipts[request.id]);
+  assert.deepEqual(applyOperation(altered.data, request, NOW + 3).receipt, created.receipt);
+});
+
+test('malformed and unavailable source publications reject atomically while their original rejected payloads survive restart', async () => {
+  await withCommunityStore(async ({ store, op, filePath }) => {
+    const before = await store.getState();
+    const references = [null, [], { opportunityId: CURATED_SOURCE_REF.opportunityId }, { ...CURATED_SOURCE_REF, checkedAt: '2026-10-29T23:12:57.514Z' },
+      { ...CURATED_SOURCE_REF, opportunityId: 'bad id' }, { ...CURATED_SOURCE_REF, snapshotId: 'unavailable-snapshot' }];
+    const rejected = [];
+    for (const [index, sourceRef] of references.entries()) {
+      const requests = [
+        await op({ type: 'create-action', actionId: `invalid-source-${index}`, action: authored({ sourceRef }) }),
+        await op({ type: 'change-plan', replacementActionId: `invalid-source-change-${index}`, expectedChangeId: null,
+          changeReason: 'Keep the original until this source reference can be reviewed.', action: authored({ sourceRef }) }),
+      ];
+      for (const request of requests) {
+        const result = await store.submit(request);
+        assert.equal(result.receipt.accepted, false);
+        assert.match(result.receipt.reason, /source reference|source snapshot/i);
+        assert.deepEqual(result.snapshot.actions, before.actions, 'neither a rejected create nor change leaves an orphan or edits its original');
+        rejected.push({ request, receipt: result.receipt });
+      }
+    }
+    const restarted = await createDemoStore({ filePath, now: () => NOW + 1 });
+    const saved = JSON.parse(await readFile(filePath, 'utf8'));
+    for (const { request, receipt } of rejected) {
+      assert.deepEqual(saved.receipts[request.id].operation, request, 'invalid input is retained as history, not treated as a published record');
+      assert.deepEqual((await restarted.submit(request)).receipt, receipt);
+    }
+    assert.deepEqual((await restarted.getState()).actions, before.actions);
+  });
+});
+
+test('well-shaped unavailable source history survives migration and a replacement keeps its separately selected known snapshot', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'zaction-source-history-'));
+  try {
+    const filePath = join(directory, 'room.json');
+    const saved = createAction(createDemoData(NOW), 'older-source-plan').data;
+    const unavailable = { ...CURATED_SOURCE_REF, snapshotId: 'older-unavailable-snapshot' };
+    target(saved, 'older-source-plan').sourceRef = unavailable;
+    saved.keepUnknownRoot = { retain: true };
+    const migrated = migrateDemoData(saved);
+    assert.deepEqual(migrated, saved, 'a shape-valid unavailable snapshot is neither stripped nor resolved to the current catalog');
+    await writeFile(filePath, JSON.stringify(saved));
+    const store = await createDemoStore({ filePath, now: () => NOW });
+    const before = target(await store.getState(), 'older-source-plan');
+    const change = operation({ snapshot: await store.getState() }, { actionId: before.id, type: 'change-plan', replacementActionId: 'new-source-plan',
+      expectedChangeId: null, changeReason: 'Start a fresh question using the reviewed source note.', action: authored({ sourceRef: { ...CURATED_SOURCE_REF } }) });
+    const accepted = await store.submit(change);
+    assert.equal(accepted.receipt.accepted, true);
+    const original = target(accepted.snapshot, before.id);
+    for (const key of Object.keys(before).filter(key => key !== 'lifecycle')) assert.deepEqual(original[key], before[key], `${key} stays on the historical plan`);
+    assert.deepEqual(original.sourceRef, unavailable);
+    assert.deepEqual(target(accepted.snapshot, 'new-source-plan').sourceRef, CURATED_SOURCE_REF);
+    assert.equal(target(accepted.snapshot, 'new-source-plan').sourceKind, 'member-provided');
+    const restarted = await createDemoStore({ filePath, now: () => NOW + 1 });
+    const replay = await restarted.submit(change);
+    assert.deepEqual(replay.receipt, accepted.receipt);
+    assert.deepEqual(target(replay.snapshot, before.id).sourceRef, unavailable);
+    assert.deepEqual(target(replay.snapshot, 'new-source-plan').sourceRef, CURATED_SOURCE_REF);
+    assert.deepEqual(JSON.parse(await readFile(filePath, 'utf8')).keepUnknownRoot, saved.keepUnknownRoot);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('missing legacy source metadata stays absent and malformed published metadata preserves exact saved bytes', async () => {
+  const baseline = createAction(createDemoData(NOW)).data;
+  assert.deepEqual(migrateDemoData(baseline), baseline);
+  assert.ok(baseline.snapshot.actions.every(action => !Object.hasOwn(action, 'sourceRef')));
+  const ownUndefined = structuredClone(baseline);
+  target(ownUndefined, 'library-access').sourceRef = undefined;
+  assert.throws(() => migrateDemoData(ownUndefined), /corrupt|unsupported/i, 'a malformed present property never becomes a missing legacy reference');
+  const directory = await mkdtemp(join(tmpdir(), 'zaction-corrupt-source-'));
+  try {
+    const filePath = join(directory, 'room.json');
+    for (const sourceRef of [null, 'not-a-reference', { opportunityId: CURATED_SOURCE_REF.opportunityId }, { ...CURATED_SOURCE_REF, current: true }, { ...CURATED_SOURCE_REF, snapshotId: 'bad id' }]) {
+      const malformed = structuredClone(baseline);
+      target(malformed, 'library-access').sourceRef = sourceRef;
+      const original = JSON.stringify(malformed, null, 4) + '\n';
+      await writeFile(filePath, original);
+      assert.throws(() => migrateDemoData(malformed), /corrupt|unsupported/i);
+      assert.deepEqual(target(malformed, 'library-access').sourceRef, sourceRef);
+      await assert.rejects(createDemoStore({ filePath, now: () => NOW }), /corrupt|unsupported/i);
+      assert.equal(await readFile(filePath, 'utf8'), original);
+    }
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test('legacy queued creates and changes without source references remain unchanged through restart and replay', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'zaction-legacy-source-'));
+  try {
+    const filePath = join(directory, 'room.json');
+    let store = await createDemoStore({ filePath, now: () => NOW });
+    const queuedCreate = operation({ snapshot: await store.getState() }, { type: 'create-action', actionId: 'legacy-source-plan', action: authored() });
+    store = await createDemoStore({ filePath, now: () => NOW + 1 });
+    const created = await store.submit(queuedCreate);
+    assert.equal(created.receipt.accepted, true);
+    const queuedChange = operation({ snapshot: created.snapshot }, { actionId: queuedCreate.actionId, type: 'change-plan', replacementActionId: 'legacy-source-successor',
+      expectedChangeId: null, changeReason: 'Keep the previously prepared member-authored question.', action: authored({ title: 'A reviewed library-access question' }) });
+    store = await createDemoStore({ filePath, now: () => NOW + 2 });
+    const changed = await store.submit(queuedChange);
+    assert.equal(changed.receipt.accepted, true);
+    store = await createDemoStore({ filePath, now: () => NOW + 3 });
+    assert.deepEqual((await store.submit(queuedCreate)).receipt, created.receipt);
+    assert.deepEqual((await store.submit(queuedChange)).receipt, changed.receipt);
+    const disk = JSON.parse(await readFile(filePath, 'utf8'));
+    assert.ok(disk.snapshot.actions.every(action => !Object.hasOwn(action, 'sourceRef')));
+    assert.equal(target(disk, queuedCreate.actionId).sourceKind, 'member-provided');
+    assert.equal(target(disk, queuedChange.replacementActionId).sourceKind, 'member-provided');
+    assert.deepEqual(disk.receipts[queuedCreate.id].operation, queuedCreate);
+    assert.deepEqual(disk.receipts[queuedChange.id].operation, queuedChange);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 for (const [label, fields] of [

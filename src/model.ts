@@ -1,3 +1,5 @@
+import type { SourceRef } from '../civic-sources.mjs';
+export type { SourceRef } from '../civic-sources.mjs';
 export type MemberId = string;
 export type Choice = 'approve' | 'oppose' | 'abstain';
 export type View = 'home' | 'plans' | 'saved' | 'help' | 'profile' | 'create' | 'edit' | 'action' | 'proposal' | 'progress' | 'learn';
@@ -64,6 +66,7 @@ export interface ActionInput {
   sourceLabel: string;
   sourceUrl: string;
   planning?: Planning;
+  sourceRef?: SourceRef;
 }
 export interface PlanChangeContext { actionId: string; expectedChangeId: string | null; reason: string }
 export interface CreationDraft extends ActionInput { id: string; change?: PlanChangeContext }
@@ -163,6 +166,7 @@ export interface Actions {
   saveDraft(actionId: string, text: string, field?: keyof ActionDrafts): Promise<boolean>;
   saveCreationDraft(draft: CreationDraft): Promise<boolean>;
   newAction(kind?: GatheringKind): Promise<void>;
+  startSourceDiscussion(sourceRef: SourceRef): Promise<'opened' | 'conflict' | 'failed'>;
   createAction(draft: CreationDraft): Promise<boolean>;
   beginPlanChange(actionId: string): Promise<boolean>;
   savePlanChangeDraft(draft: CreationDraft): Promise<boolean>;
