@@ -4,7 +4,7 @@ The human requests regular GitHub pushes and easy downloads from GitHub Releases
 
 ## Prepare a runnable milestone
 
-1. Update `package.json` and the lockfile together to the intended version. Use a prerelease version such as `0.1.0-preview.2` while this is a demonstration milestone. Do not move the existing preview.1 tag or replace its published downloads.
+1. Update `package.json` and the lockfile together to the intended version. Use a prerelease version such as `0.1.0-preview.3` while this is a preview milestone. Do not move earlier preview tags or replace their published downloads.
 2. Install from the lockfile, run domain tests, build, and run the production browser flow:
 
    ```bash
@@ -23,9 +23,11 @@ The workflow needs GitHub Actions enabled and its release job's scoped `contents
 
 ## Release notes and download contract
 
-Each runnable release identifies the source commit and package version, describes the demonstrated flow, names the actual validation, and states runtime/browser/service dependencies. `RELEASE.json` records build provenance. The ZIP includes concise hosting instructions; users extract it and run `node server.mjs` with Node.js 24, then install from the served site through their browser. Migration instructions must accompany schema changes; the multi-action preview preserves v1 room/browser data and creates a server-file backup rather than resetting the demo.
+Each runnable release identifies the source commit and package version, describes the demonstrated flow, names the actual validation, and states runtime/browser/service dependencies. `RELEASE.json` records build provenance. The ZIP includes concise hosting instructions; users extract it and run `node --use-env-proxy server.mjs` with Node.js 24.5+, then install from the served site through their browser. Migration instructions must accompany schema changes; the multi-action preview preserves v1 room/browser data and creates a server-file backup rather than resetting the demo. Bundle the self-hosted font's OFL license with its production assets.
 
-Call it a ready-to-host PWA web build. It is not a native phone/desktop installer. Document the root-path and HTTPS requirements, the public demo API, the absence of real membership protection, and remaining GPU/phone/inference/encryption gates. Do not describe checksums as publisher signatures or imply that a downloadable artifact establishes those capabilities.
+Call it a ready-to-host PWA web build. It is not a native phone/desktop installer. Document the root-path and HTTPS requirements, the public preview API, private session-data handling, the absence of unique-human membership guarantees, and remaining GPU/phone/inference/encryption gates. Do not describe checksums as publisher signatures or imply that a downloadable artifact establishes those capabilities. Reactions, RSVPs, and budget estimates must not be described as ballots, verified attendance, or payments.
+
+Weather has a separate live-provider smoke check (`npm run check:weather`). CI and release workflows observe it in a **nonblocking** step with an explicit notice or warning; it is not included in fixture or browser-flow counts. Do not infer a passing live Open-Meteo integration from overall workflow success, deterministic tests, screenshots, or an unavailable-state check. Record that step's actual provider access and any network blocker separately. A live-weather release gate would require a separate policy decision.
 
 ## Manual release fallback
 

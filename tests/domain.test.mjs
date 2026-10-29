@@ -14,14 +14,18 @@ const target = (value, id = SEED) => {
   assert.ok(action, `action ${id} exists`);
   return action;
 };
-const operation = (data, fields = {}) => ({
-  id: randomUUID(), memberId: 'alex', type: 'vote', choice: 'approve', actionId: SEED,
-  proposalRevision: 1,
-  rulesVersion: 'DEMO-RULES-v1',
-  membershipVersion: 'DEMO-MEMBERS-v1',
-  roomId: data.snapshot.roomId,
-  ...fields,
-});
+const operation = (data, fields = {}) => {
+  const actionId = fields.actionId ?? SEED;
+  const action = data.snapshot.actions.find(action => action.id === actionId);
+  return {
+    id: randomUUID(), memberId: 'alex', type: 'vote', choice: 'approve', actionId: SEED,
+    proposalRevision: action?.proposalRevision ?? 1,
+    rulesVersion: action?.rulesVersion ?? 'DEMO-RULES-v1',
+    membershipVersion: action?.membershipVersion ?? 'DEMO-MEMBERS-v1',
+    roomId: data.snapshot.roomId,
+    ...fields,
+  };
+};
 const authored = (fields = {}) => ({
   title: 'Make the library easier to use',
   description: 'Read the public access plan and gather questions for a free discussion.',
@@ -418,3 +422,165 @@ test('migration preserves corrupt or conflicting legacy data for outside recover
     assert.equal(await readFile(filePath + '.v1-backup.json', 'utf8'), 'different pre-existing backup');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
+
+async function withCommunityStore(run) {
+  const directory = await mkdtemp(join(tmpdir(), 'zaction-community-'));
+  try {
+    const filePath = join(directory, 'room.json');
+    const store = await createDemoStore({ filePath, now: () => NOW });
+    const first = await store.joinProfile({ name: 'Maya', cityId: 'new-york' });
+    const second = await store.joinProfile({ name: 'Noah', cityId: 'new-york' });
+    const op = async fields => operation({ snapshot: await store.getState() }, { memberId: first.profile.id, actionId: 'community-bbq', ...fields });
+    const create = await store.submit(await op({ type: 'create-action', action: authored({ title: 'Bring a dish to the neighborhood BBQ', planning: planning() }) }));
+    assert.equal(create.receipt.accepted, true);
+    await run({ store, first, second, op, filePath });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+test('anonymous community sessions are persisted as digests and never enter public snapshots', async () => {
+  await withCommunityStore(async ({ store, first, second, filePath }) => {
+    assert.equal(first.profile.name, 'Maya');
+    assert.equal(first.profile.synthetic, false);
+    assert.equal(first.profile.cityId, 'new-york');
+    assert.ok(first.token.length >= 40);
+    assert.equal(await store.authorized(first.profile.id, first.token), true);
+    assert.equal(await store.authorized(first.profile.id, second.token), false);
+    assert.equal(await store.authorized(first.profile.id, 'incorrect-token'), false);
+    const publicState = await store.getState();
+    assert.ok(publicState.profiles.some(profile => profile.id === first.profile.id));
+    assert.equal(Object.hasOwn(publicState, 'sessions'), false);
+    assert.equal(JSON.stringify(publicState).includes(first.token), false);
+    const raw = await readFile(filePath, 'utf8');
+    assert.equal(raw.includes(first.token), false, 'raw bearer credentials are never written to disk');
+    const disk = JSON.parse(raw);
+    assert.ok(Object.keys(disk.sessions).every(key => /^[a-f0-9]{64}$/.test(key)));
+    const restored = await createDemoStore({ filePath, now: () => NOW + 1 });
+    assert.equal(await restored.authorized(first.profile.id, first.token), true);
+  });
+});
+
+test('a valid private session resumes its profile and an invalid session cannot create a replacement', async () => {
+  await withCommunityStore(async ({ store, first }) => {
+    const count = (await store.getState()).profiles.length;
+    const resumed = await store.joinProfile({ name: 'Maya Updated', cityId: 'austin' }, first.token);
+    assert.equal(resumed.profile.id, first.profile.id);
+    assert.equal(resumed.profile.name, 'Maya Updated');
+    assert.equal(resumed.profile.cityId, 'austin');
+    assert.equal((await store.getState()).profiles.length, count);
+    await assert.rejects(store.joinProfile({ name: 'Unapproved replacement', cityId: 'austin' }, 'unrecognized-private-session'));
+    assert.equal((await store.getState()).profiles.length, count);
+    assert.equal(await store.authorized(first.profile.id, first.token), true);
+  });
+});
+
+test('interest reactions are durable idempotent toggles, isolated from other actions and votes', async () => {
+  await withCommunityStore(async ({ store, first, op }) => {
+    const reaction = await op({ type: 'react', active: true });
+    const accepted = await store.submit(reaction);
+    assert.equal(accepted.receipt.accepted, true);
+    const replay = await store.submit(reaction);
+    assert.deepEqual(replay.receipt, accepted.receipt);
+    assert.equal(target(replay.snapshot, 'community-bbq').reactions.length, 1);
+    assert.equal(target(replay.snapshot).reactions.length, 0);
+    assert.equal(target(replay.snapshot, 'community-bbq').ballots.length, 0);
+    await store.submit(await op({ type: 'react', active: true }));
+    assert.equal(target(await store.getState(), 'community-bbq').reactions.length, 1);
+    await store.submit(await op({ type: 'react', active: false }));
+    assert.equal(target(await store.getState(), 'community-bbq').reactions.length, 0);
+    const vote = await store.submit(await op({ type: 'vote', choice: 'approve' }));
+    assert.equal(vote.receipt.accepted, true);
+    assert.equal(target(vote.snapshot, 'community-bbq').ballots[0].memberId, first.profile.id);
+    assert.equal(target(vote.snapshot, 'community-bbq').ballots.length, 1, 'a registered member has exactly one equal-weight ballot');
+    const duplicate = await store.submit(await op({ type: 'vote', choice: 'oppose' }));
+    assert.equal(duplicate.receipt.accepted, false);
+  });
+});
+
+test('RSVP changes replace one member status without voting, changing other actions, or duplicating retries', async () => {
+  await withCommunityStore(async ({ store, op }) => {
+    const going = await op({ type: 'rsvp', status: 'going' });
+    const first = await store.submit(going);
+    assert.equal(first.receipt.accepted, true);
+    const replay = await store.submit(going);
+    assert.deepEqual(replay.receipt, first.receipt);
+    assert.equal(target(replay.snapshot, 'community-bbq').rsvps.length, 1);
+    await store.submit(await op({ type: 'rsvp', status: 'maybe' }));
+    const state = await store.getState();
+    assert.equal(target(state, 'community-bbq').rsvps.length, 1);
+    assert.equal(target(state, 'community-bbq').rsvps[0].status, 'maybe');
+    assert.equal(target(state, 'community-bbq').ballots.length, 0);
+    assert.equal(target(state).rsvps.length, 0);
+    const invalid = await store.submit(await op({ type: 'rsvp', status: 'pay-to-join' }));
+    assert.equal(invalid.receipt.accepted, false);
+    const nongathering = await store.submit(await op({ actionId: SEED, type: 'rsvp', status: 'going' }));
+    assert.equal(nongathering.receipt.accepted, false, 'RSVP is not invented for an action with no gathering plan');
+    await store.submit(await op({ type: 'rsvp', status: 'none' }));
+    assert.equal(target(await store.getState(), 'community-bbq').rsvps.length, 0);
+  });
+});
+
+test('legacy fixture voting eligibility stays separate from community participation', async () => {
+  await withCommunityStore(async ({ store, op }) => {
+    const vote = await store.submit(await op({ actionId: SEED, type: 'vote', choice: 'approve' }));
+    assert.equal(vote.receipt.accepted, false, 'new profiles do not rewrite the old frozen fixture membership');
+    const comment = await store.submit(await op({ actionId: SEED, type: 'contribute', text: 'A community question on the sample source.' }));
+    assert.equal(comment.receipt.accepted, true);
+    const reaction = await store.submit(await op({ actionId: SEED, type: 'react', active: true }));
+    assert.equal(reaction.receipt.accepted, true);
+    assert.equal(target(reaction.snapshot).ballots.length, 0);
+  });
+});
+
+test('comment replies require an existing parent on the same action', async () => {
+  await withCommunityStore(async ({ store, second, op }) => {
+    const parentOp = await op({ type: 'contribute', text: 'Can we include vegetarian choices?' });
+    const parent = await store.submit(parentOp);
+    assert.equal(parent.receipt.accepted, true);
+    const reply = await store.submit(await op({ type: 'contribute', memberId: second.profile.id, text: 'I can bring a vegetarian dish.', parentId: parentOp.id }));
+    assert.equal(reply.receipt.accepted, true);
+    assert.equal(target(reply.snapshot, 'community-bbq').contributions[1].parentId, parentOp.id);
+    const other = await store.submit(await op({ type: 'create-action', actionId: 'second-community-action', action: authored() }));
+    assert.equal(other.receipt.accepted, true);
+    const crossTarget = await store.submit(await op({ type: 'contribute', actionId: 'second-community-action', text: 'Do not put this reply on a different action.', parentId: parentOp.id }));
+    assert.equal(crossTarget.receipt.accepted, false);
+    assert.equal(target(crossTarget.snapshot, 'second-community-action').contributions.length, 0);
+    const missing = await store.submit(await op({ type: 'contribute', text: 'Unknown parent.', parentId: 'missing-comment' }));
+    assert.equal(missing.receipt.accepted, false);
+  });
+});
+
+const planning = fields => ({ kind: 'bbq', date: '2026-11-07', timeHint: 'Afternoon', cityId: 'new-york', place: 'Public park, exact spot to be agreed',
+  budgetCents: 8000, expectedPeople: 8, rainPlan: 'Move to a free covered public space after checking access.', accessibility: 'Step-free route and seating', bring: ['A dish to share', 'Water bottle'], ...fields });
+
+test('a social plan stores a budget estimate and rain/access details without creating payments', async () => {
+  await withCommunityStore(async ({ store, op }) => {
+    const created = await store.submit(await op({ type: 'create-action', actionId: 'budgeted-bbq', action: authored({ planning: planning() }) }));
+    assert.equal(created.receipt.accepted, true);
+    const action = target(created.snapshot, 'budgeted-bbq');
+    assert.equal(action.planning.budgetCents, 8000);
+    assert.equal(action.planning.expectedPeople, 8);
+    assert.equal(action.planning.budgetCents / action.planning.expectedPeople, 1000);
+    assert.match(action.planning.rainPlan, /covered/);
+    assert.equal(Object.hasOwn(action, 'payments'), false);
+  });
+});
+
+for (const [label, fields] of [
+  ['negative estimate', { budgetCents: -1 }],
+  ['fractional cents', { budgetCents: 100.5 }],
+  ['oversized estimate', { budgetCents: 1_000_001 }],
+  ['zero people', { expectedPeople: 0 }],
+  ['fractional people', { expectedPeople: 2.5 }],
+  ['oversized group', { expectedPeople: 101 }],
+  ['unsupported city', { cityId: 'not-a-city' }],
+  ['invalid calendar date', { date: '2026-02-31' }],
+  ['unrecognized activity', { kind: 'pay-for-votes' }],
+  ['too many bring items', { bring: Array(9).fill('item') }],
+]) {
+  test(`social planning rejects ${label} without changing the authored actions`, () => {
+    const data = createDemoData(NOW);
+    const result = createAction(data, 'invalid-social-plan', { planning: planning(fields) });
+    assert.equal(result.receipt.accepted, false);
+    assert.equal(result.snapshot.actions.length, 1);
+  });
+}

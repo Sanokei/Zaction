@@ -1,9 +1,10 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
+import '@fontsource-variable/bricolage-grotesque';
 import './styles.css';
-import { MEMBERS, ACTION_LIMITS, emptyActionInput, actionFor, draftsFor, progressFor, type ActionInput, type Actions, type AppState, type Choice, type CreationDraft, type DemoSnapshot, type LocalState, type Operation, type Receipt, type View } from './model';
-import { emptyLocal, loadLocal, updateLocal } from './store';
+import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
+import { emptyLocal, loadLocal, loadCommunitySession, updateLocal, type SessionChange } from './store';
 import { parseSnapshot, validActionId } from './migrations';
 
 const root = createRoot(document.getElementById('root')!);
@@ -11,7 +12,7 @@ let local: LocalState = emptyLocal();
 // The stored last selection is a startup default, not cross-tab navigation.
 // Each open tab keeps its own route target while sharing durable records.
 let activeActionId = local.selectedActionId;
-const views: View[] = ['home', 'create', 'action', 'proposal', 'progress', 'learn'];
+const views: View[] = ['home', 'plans', 'saved', 'profile', 'create', 'action', 'proposal', 'progress', 'learn'];
 function currentRoute(): { view: View; id?: string } | null {
   const [view, encodedId] = location.hash.slice(1).split('/');
   if (!views.includes(view as View)) return null;
@@ -30,23 +31,31 @@ let bootstrapped = false;
 interface InstallPrompt extends Event { prompt(): Promise<void>; userChoice: Promise<{ outcome: string }> }
 let installPrompt: InstallPrompt | null = null;
 let workerRegistration: ServiceWorkerRegistration | undefined;
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 
 function render() {
   root.render(bootstrapped
     ? <React.StrictMode><App state={{ ...local, ...runtime, selectedActionId: activeActionId }} actions={actions} /></React.StrictMode>
     : <main className="boot-screen" role="status"><strong>zaction.</strong><p>Opening your saved work…</p></main>);
 }
-function updateRuntime(patch: Partial<typeof runtime>) { runtime = { ...runtime, ...patch }; render(); }
+function updateRuntime(patch: Partial<typeof runtime>) {
+  runtime = { ...runtime, ...patch };
+  if (patch.notice !== undefined) {
+    clearTimeout(noticeTimer);
+    if (patch.notice) noticeTimer = setTimeout(() => { runtime = { ...runtime, notice: null }; render(); }, 7000);
+  }
+  render();
+}
 function errorMessage(error: unknown) { return error instanceof Error ? error.message : 'Something interrupted this action.'; }
 
-async function mutate(update: (previous: LocalState) => LocalState): Promise<boolean> {
+async function mutate(update: (previous: LocalState) => LocalState, session?: SessionChange): Promise<boolean> {
   if (!initialized) {
     updateRuntime({ error: 'Local storage has not opened safely. Existing data is preserved. Retry to reopen storage before saving.' });
     return false;
   }
   let success = false;
   const operation = writes.then(async () => {
-    local = await updateLocal(update);
+    local = await updateLocal(update, session);
     success = true;
     render();
   });
@@ -61,19 +70,35 @@ function latestSnapshot(previous: DemoSnapshot | null, incoming: DemoSnapshot): 
   return previous?.roomId === incoming.roomId && previous.sequence > incoming.sequence ? previous : incoming;
 }
 
-async function request(path: string, options: RequestInit = {}) {
-  const response = await fetch(path, { ...options, cache: 'no-store', signal: AbortSignal.timeout(7000) });
-  if (!response.ok) throw new Error(`The demo room could not complete the request (${response.status}).`);
-  return response.json();
+async function request(path: string, options: RequestInit = {}, memberId?: string) {
+  const headers = new Headers(options.headers);
+  if (options.method === 'POST' && local.snapshot) {
+    const session = await loadCommunitySession(local.snapshot.roomId);
+    if (session && (!memberId || session.memberId === memberId)) headers.set('Authorization', `Bearer ${session.token}`);
+  }
+  const response = await fetch(path, { ...options, headers, cache: 'no-store', signal: AbortSignal.timeout(path.startsWith('/api/weather') ? 11000 : 7000) });
+  const result = await response.json();
+  if (!response.ok && !(result?.receipt?.accepted === false && result?.snapshot)) throw new Error(typeof result?.error === 'string' ? result.error : `The community could not complete this request (${response.status}).`);
+  return result;
 }
 
 const acceptedMessages: Record<Operation['type'], string> = {
-  'create-action': 'Your action and its proposal are now shared with the demo group.',
-  contribute: 'Your question is now shared with the demo group.', vote: 'Your ballot was accepted by the demo room.',
-  close: 'The demo vote is closed. Review its outcome and publish the minutes.',
-  minutes: 'Your decision notes are published. Earlier versions remain available.',
-  'complete-task': 'Your self-reported task completion is now shared with the demo group.',
+  'create-action': 'Your plan is shared. Let’s see what people think.',
+  contribute: 'Your comment is posted.', vote: 'Your vote is recorded for this proposal.',
+  close: 'The vote is closed. Add the decision notes when you’re ready.',
+  minutes: 'Decision notes published. Earlier versions are still available.',
+  'complete-task': 'Task marked complete (self-reported).',
+  react: 'Your reaction is shared. It never changes a group vote.',
+  rsvp: 'Your RSVP is updated. It is a plan to join, not proof of attendance.',
 };
+
+function templateDraft(cityId: CityId, kind?: GatheringKind): CreationDraft {
+  const blank = { id: crypto.randomUUID(), ...emptyActionInput(), planning: emptyPlanning(cityId, kind ?? 'idea') };
+  if (!kind) return blank;
+  const titles = { bbq: 'A BBQ with good people', potluck: 'Bring a dish, meet a neighbor', games: 'Board games and good company', walk: 'A little fresh air, together', help: 'A little help for our neighborhood', idea: 'An idea worth talking about' };
+  const descriptions = { bbq: 'Let’s share some food, meet a few neighbors, and make a good afternoon of it.', potluck: 'Bring something if you can. Come for the food and stay for the conversation.', games: 'An easy-going hangout with board games. New faces and first-time players welcome.', walk: 'Let’s get outside for a friendly neighborhood walk at a comfortable pace.', help: 'A small, practical way to make our community a little better, together.', idea: 'What could we do together that would make this community more welcoming?' };
+  return { ...blank, title: titles[kind], description: descriptions[kind], proposalTitle: `Shall we make “${titles[kind]}” happen?`, beneficiaries: 'Our community' };
+}
 
 async function synchronize(): Promise<void> {
   if (!initialized) return;
@@ -86,7 +111,7 @@ async function synchronize(): Promise<void> {
     updateRuntime({ connectivity: 'online' });
     for (const pending of [...local.pending]) {
       if (!navigator.onLine) { updateRuntime({ connectivity: 'offline' }); break; }
-      const result = await request('/api/operations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending) });
+      const result = await request('/api/operations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending) }, pending.memberId);
       const nextSnapshot = parseSnapshot(result.snapshot);
       const receipt: Receipt = result.receipt;
       if (!receipt || receipt.id !== pending.id || receipt.actionId !== pending.actionId || typeof receipt.accepted !== 'boolean') throw new Error('The demo room returned an invalid receipt. Your pending action was preserved.');
@@ -102,7 +127,7 @@ async function synchronize(): Promise<void> {
         };
       });
       if (!saved) break;
-      updateRuntime(receipt.accepted ? { notice: acceptedMessages[pending.type], error: null } : { error: `Not accepted: ${receipt.reason}. Your original action is retained in your submission history.`, notice: null });
+      updateRuntime(receipt.accepted ? (['react', 'rsvp'].includes(pending.type) ? { error: null } : { notice: acceptedMessages[pending.type], error: null }) : { error: `Not accepted: ${receipt.reason}. Your original submission is kept in its history.`, notice: null });
     }
   } catch {
     updateRuntime({ connectivity: navigator.onLine ? 'unavailable' : 'offline' });
@@ -113,7 +138,7 @@ async function synchronize(): Promise<void> {
 }
 
 async function enqueue(type: Operation['type'], actionId: string, extra: Partial<Operation> = {}): Promise<boolean> {
-  if (!local.memberId) { updateRuntime({ error: 'Choose a synthetic demo profile before sharing or voting.' }); return false; }
+  if (!local.memberId) { updateRuntime({ error: 'Make a community profile before sharing or joining in. Your draft stays here.' }); return false; }
   if (!local.snapshot) { updateRuntime({ error: 'Connect once to load the demo room before submitting an action.' }); return false; }
   const target = actionFor(local, actionId);
   if (!validActionId(actionId) || (type !== 'create-action' && !target)) {
@@ -125,11 +150,12 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
   const operation: Operation = {
     id: crypto.randomUUID(), type, memberId: local.memberId, roomId: local.snapshot.roomId, actionId,
     proposalRevision: target?.proposalRevision ?? 1, rulesVersion: target?.rulesVersion ?? 'DEMO-RULES-v1',
-    membershipVersion: target?.membershipVersion ?? 'DEMO-MEMBERS-v1', ...extra,
+    membershipVersion: target?.membershipVersion ?? (MEMBERS.some(member => member.id === local.memberId) ? 'DEMO-MEMBERS-v1' : 'COMMUNITY-PREVIEW-v1'), ...extra,
   };
   updateRuntime({ busy: true, error: null });
   const saved = await mutate(previous => ({ ...previous, pending: [...previous.pending, operation] }));
-  updateRuntime({ busy: false, ...(saved ? { notice: 'Saved on this device — awaiting group acceptance.' } : {}) });
+  const announceQueue = !['react', 'rsvp'].includes(type) || runtime.connectivity !== 'online';
+  updateRuntime({ busy: false, ...(saved && announceQueue ? { notice: 'Saved on this device — waiting to sync.' } : {}) });
   if (saved) void synchronize();
   return saved;
 }
@@ -145,7 +171,51 @@ const actions: Actions = {
   },
   async join(memberId) {
     if (!MEMBERS.some(member => member.id === memberId)) return;
-    if (await mutate(previous => ({ ...previous, memberId }))) updateRuntime({ error: null, notice: `You’re using ${MEMBERS.find(member => member.id === memberId)!.name}, a synthetic demo profile.` });
+    const name = MEMBERS.find(member => member.id === memberId)!.name;
+    if (await mutate(previous => ({ ...previous, memberId, community: { ...communityFor(previous), name, onboarded: true, browsing: true } }))) updateRuntime({ error: null, notice: `You’re trying ${name}, a sample profile. Use your own profile for new community plans.` });
+  },
+  async finishOnboarding(input) {
+    if (!await actions.savePreferences(input)) return false;
+    if (input.name.trim().length < 2 || input.name.trim().length > 40) { updateRuntime({ error: 'Choose a public nickname of 2–40 characters. You do not need to use your real name.' }); return false; }
+    if (!local.snapshot) await synchronize();
+    if (!local.snapshot) { updateRuntime({ error: 'Connect once to join the community. Your setup choices are saved on this device.' }); return false; }
+    updateRuntime({ busy: true, error: null });
+    try {
+      const result = await request('/api/community/join', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: input.name.trim(), cityId: input.cityId }) });
+      const snapshot = parseSnapshot(result.snapshot);
+      const profile = result.profile;
+      if (!profile || typeof profile.id !== 'string' || typeof result.token !== 'string' || !/^[A-Za-z0-9_-]{32,512}$/.test(result.token) || !snapshot.profiles?.some(item => item.id === profile.id)) throw new Error('The community returned an unsupported profile. Your setup is still saved here.');
+      const saved = await mutate(previous => ({ ...previous, memberId: profile.id, snapshot: latestSnapshot(previous.snapshot, snapshot), community: { ...communityFor(previous), ...input, name: profile.name, interests: [...input.interests], onboarded: true, browsing: false }, lastSync: new Date().toISOString() }), { roomId: snapshot.roomId, memberId: profile.id, token: result.token });
+      if (saved) updateRuntime({ notice: `You’re in, ${profile.name}. Start with something you’d enjoy doing together.`, error: null });
+      return saved;
+    } catch (error) { updateRuntime({ error: `Couldn’t finish joining yet. ${errorMessage(error)} Your setup choices are still saved.` }); return false; }
+    finally { updateRuntime({ busy: false }); }
+  },
+  async browseCommunity() {
+    if (await mutate(previous => ({ ...previous, community: { ...communityFor(previous), browsing: true } }))) actions.navigate('home');
+  },
+  async savePreferences(preferences) {
+    const current = { ...communityFor(local), ...preferences };
+    if (typeof current.name !== 'string' || current.name.length > 40 || !CITY_OPTIONS.some(city => city.id === current.cityId) || !Array.isArray(current.interests) || !current.interests.every(id => KIND_OPTIONS.some(kind => kind.id === id))) { updateRuntime({ error: 'Review your nickname, city, and interests. Your earlier choices are still saved.' }); return false; }
+    return mutate(previous => ({ ...previous, community: { ...communityFor(previous), ...preferences, ...(preferences.interests ? { interests: [...new Set(preferences.interests)] } : {}) } }));
+  },
+  async react(actionId, active) { await enqueue('react', actionId, { active }); },
+  async rsvp(actionId, status) { await enqueue('rsvp', actionId, { status }); },
+  async toggleSave(actionId) {
+    if (!validActionId(actionId)) return;
+    if (await mutate(previous => ({ ...previous, savedActionIds: (previous.savedActionIds ?? []).includes(actionId) ? previous.savedActionIds!.filter(id => id !== actionId) : [...(previous.savedActionIds ?? []), actionId] }))) updateRuntime({ notice: 'Your saved plans stay private on this device.', error: null });
+  },
+  async setReplyTo(actionId, parentId) {
+    if (!validActionId(actionId)) return;
+    await mutate(previous => ({ ...previous, replyTargets: { ...previous.replyTargets, [actionId]: parentId } }));
+  },
+  async getWeather(cityId, date) {
+    try {
+      const result = await request(`/api/weather?cityId=${encodeURIComponent(cityId)}&date=${encodeURIComponent(date)}`);
+      if (result?.status === 'available' && [result.temperatureMaxF, result.temperatureMinF, result.rainChance, result.windMph].every(Number.isFinite) && typeof result.checkedAt === 'string') return result;
+      if (result?.status === 'unavailable' && typeof result.reason === 'string') return result;
+      throw new Error('Unsupported forecast response.');
+    } catch { return { status: 'unavailable', cityId, date, sourceUrl: 'https://open-meteo.com/', reason: 'The forecast could not be loaded. Try again, or include a rain backup while making your plan.' }; }
   },
   async saveDraft(actionId, text, field = 'discussion') {
     if (!validActionId(actionId)) return false;
@@ -153,22 +223,27 @@ const actions: Actions = {
     return mutate(previous => ({ ...previous, drafts: { ...previous.drafts, [actionId]: { ...draftsFor(previous, actionId), [field]: text } } }));
   },
   async saveCreationDraft(draft) {
-    if (!validActionId(draft.id) || !Object.entries(ACTION_LIMITS).every(([field, limit]) => typeof draft[field as keyof CreationDraft] === 'string' && draft[field as keyof CreationDraft].length <= limit)) {
+    if (!validActionId(draft.id) || !Object.entries(ACTION_LIMITS).every(([field, limit]) => { const value = draft[field as keyof CreationDraft]; return typeof value === 'string' && value.length <= limit; })) {
       updateRuntime({ error: 'The action draft contains an unsupported field or is too long. Keep your text and review the field limits.' }); return false;
     }
     return mutate(previous => ({ ...previous, creationDraft: { ...draft } }));
   },
-  async newAction() {
+  async newAction(kind) {
     // An unfinished creation draft is resumed, never silently replaced. Once
     // accepted, the published action preserves it and another draft can begin.
-    if (local.snapshot?.actions.some(action => action.id === local.creationDraft.id)) {
-      if (!await mutate(previous => ({ ...previous, creationDraft: { id: crypto.randomUUID(), ...emptyActionInput() } }))) return;
-    }
+    if (!await mutate(previous => {
+      const current = previous.creationDraft;
+      const suggested = templateDraft(communityFor(previous).cityId, kind);
+      if (previous.snapshot?.actions.some(action => action.id === current.id)) return { ...previous, creationDraft: suggested };
+      if (!current.title.trim() && kind) return { ...previous, creationDraft: { ...current, title: suggested.title, description: current.description || suggested.description, proposalTitle: current.proposalTitle || suggested.proposalTitle, beneficiaries: current.beneficiaries || suggested.beneficiaries, planning: current.planning ? { ...current.planning, kind } : suggested.planning } };
+      return previous;
+    })) return;
     actions.navigate('create');
   },
   async createAction(draft) {
     if (!await actions.saveCreationDraft(draft)) return false;
-    const input = Object.fromEntries(Object.keys(ACTION_LIMITS).map(field => [field, draft[field as keyof CreationDraft].trim()])) as unknown as ActionInput;
+    const input = Object.fromEntries(Object.keys(ACTION_LIMITS).map(field => [field, String(draft[field as keyof CreationDraft]).trim()])) as unknown as ActionInput;
+    if (draft.planning) input.planning = structuredClone(draft.planning);
     if (input.title.length < 3 || input.description.length < 10 || input.proposalTitle.length < 3 || input.beneficiaries.length < 3) {
       updateRuntime({ error: 'Add an action title, a description of at least 10 characters, a proposal title, and who benefits. Your draft is saved.' }); return false;
     }
@@ -181,10 +256,10 @@ const actions: Actions = {
     }
     return enqueue('create-action', draft.id, { action: input });
   },
-  async publishContribution(actionId, text) {
+  async publishContribution(actionId, text, parentId) {
     const trimmed = text.trim();
     if (!trimmed || trimmed.length > 2000) { updateRuntime({ error: 'Write a question or correction of 1–2,000 characters.' }); return; }
-    await enqueue('contribute', actionId, { text: trimmed });
+    await enqueue('contribute', actionId, { text: trimmed, ...(parentId ? { parentId } : {}) });
   },
   async castVote(actionId, choice: Choice) { await enqueue('vote', actionId, { choice }); },
   async closeVote(actionId) { await enqueue('close', actionId); },

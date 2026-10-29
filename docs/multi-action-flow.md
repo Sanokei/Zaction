@@ -1,5 +1,7 @@
 # Multi-action authoring increment
 
+> Historical preview.2 evidence: source `14f314293bfd95b04ec732b9308b65cf398f0e1f`, tag `v0.1.0-preview.2`. Its 52 domain/HTTP and 16 browser checks apply to that source, not the later social-planning increment. See [the current increment](social-planning-increment.md) for the new scope.
+
 Target: `0.1.0-preview.2`. This document describes the authoring increment, its acceptance contract, and the local release-candidate evidence below. Tagged-release validation belongs to that exact source's workflow run; earlier-release results do not establish the new behavior.
 
 ## Why the first fixture needed a next step

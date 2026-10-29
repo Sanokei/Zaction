@@ -113,3 +113,51 @@ test('chunked UTF-8 contributions survive a split inside a multibyte character',
     assert.equal(response.body.snapshot.actions.find(action => action.id === 'reading-circle').contributions[0].text, text);
   });
 });
+
+test('community sessions authorize only their own public profile and never appear in public state', async () => {
+  await withServer(async ({ request }) => {
+    const join = async name => {
+      const response = await request('/api/community/join', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, cityId: 'new-york' }) });
+      assert.ok(response.ok);
+      return response.json();
+    };
+    const first = await join('Maya');
+    const second = await join('Noah');
+    assert.notEqual(first.profile.id, second.profile.id);
+    assert.equal(first.profile.synthetic, false);
+    const publicState = await (await request('/api/state')).json();
+    assert.equal(Object.hasOwn(publicState, 'sessions'), false);
+    assert.equal(JSON.stringify(publicState).includes(first.token), false);
+    assert.equal(JSON.stringify(first.snapshot).includes(first.token), false);
+    const operation = { id: randomUUID(), memberId: first.profile.id, type: 'create-action', actionId: 'my-community-action',
+      proposalRevision: 1, rulesVersion: 'DEMO-RULES-v1', membershipVersion: 'COMMUNITY-PREVIEW-v1', roomId: publicState.roomId,
+      action: { title: 'Read the library access plan', description: 'Prepare questions about a public library access plan.', proposalTitle: 'Hold a free reading session', beneficiaries: 'Neighbors who use the library', whenWhere: '', sourceLabel: '', sourceUrl: '' } };
+    const send = (op, token) => request('/api/operations', { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(op) });
+    const unauthenticated = await send(operation);
+    assert.equal(unauthenticated.status, 401);
+    assert.equal((await unauthenticated.json()).receipt.accepted, false);
+    const impersonated = await send(operation, second.token);
+    assert.equal(impersonated.status, 403);
+    assert.equal((await impersonated.json()).receipt.accepted, false);
+    const accepted = await send(operation, first.token);
+    assert.equal(accepted.status, 200);
+    assert.equal((await accepted.json()).receipt.accepted, true, 'auth failures do not poison the stable operation ID');
+    const snapshot = await (await request('/api/state')).json();
+    assert.equal(snapshot.actions.filter(action => action.id === operation.actionId).length, 1);
+    assert.equal(snapshot.actions.find(action => action.id === operation.actionId).membershipVersion, 'COMMUNITY-PREVIEW-v1');
+  });
+});
+
+test('community onboarding rejects malformed names, unsupported cities, and cross-origin writes', async () => {
+  await withServer(async ({ request }) => {
+    const initial = await (await request('/api/state')).json();
+    for (const input of [{ name: '', cityId: 'new-york' }, { name: 'Maya', cityId: 'unknown-city' }, { name: 'x'.repeat(41), cityId: 'new-york' }]) {
+      const response = await request('/api/community/join', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) });
+      assert.equal(response.status, 400);
+    }
+    const crossOrigin = await request('/api/community/join', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://attacker.invalid' }, body: JSON.stringify({ name: 'Maya', cityId: 'new-york' }) });
+    assert.equal(crossOrigin.status, 403);
+    const after = await (await request('/api/state')).json();
+    assert.equal(after.profiles.length, initial.profiles.length);
+  });
+});

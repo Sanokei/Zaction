@@ -1,20 +1,27 @@
 {
   "name": "zaction",
-  "version": "0.1.0-preview.2",
+  "version": "0.1.0-preview.3",
   "private": true,
   "type": "module",
   "description": "A local-first civic action PWA: small actions, shared power.",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24.5"
+  },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "dev:relay": "PORT=4174 node server.mjs",
+    "dev:relay": "PORT=4174 node --use-env-proxy server.mjs",
     "build": "tsc --noEmit && vite build && node scripts/build-service-worker.mjs",
-    "start": "node server.mjs",
+    "start": "node --use-env-proxy server.mjs",
     "test": "node --test --test-isolation=none tests/*.test.mjs",
     "test:e2e": "node tests/e2e.mjs",
-    "release:package": "node scripts/package-release.mjs"
+    "release:package": "node scripts/package-release.mjs",
+    "check:weather": "node --use-env-proxy scripts/check-weather.mjs"
   },
-  "dependencies": { "react": "19.3.1", "react-dom": "19.3.1" },
+  "dependencies": {
+    "@fontsource-variable/bricolage-grotesque": "5.3.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
   "devDependencies": {
     "@types/node": "24.10.0",
     "@types/react": "19.3.0",

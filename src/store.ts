@@ -2,6 +2,8 @@ import type { LocalState } from './model';
 import { emptyLocalState, normalizeLocal } from './migrations';
 
 const DATABASE = 'zaction-local-v1';
+export interface CommunitySession { memberId: string; token: string }
+export interface SessionChange extends CommunitySession { roomId: string }
 let database: Promise<IDBDatabase> | undefined;
 
 function openDatabase(): Promise<IDBDatabase> {
@@ -39,7 +41,7 @@ export function emptyLocal(): LocalState {
 
 // Read and update in the same transaction so a polling tab cannot replace
 // another tab's newly saved draft or pending submission with its old snapshot.
-export async function updateLocal(update: (previous: LocalState) => LocalState): Promise<LocalState> {
+export async function updateLocal(update: (previous: LocalState) => LocalState, session?: SessionChange): Promise<LocalState> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const transaction = db.transaction('records', 'readwrite');
@@ -47,6 +49,17 @@ export async function updateLocal(update: (previous: LocalState) => LocalState):
     const request = records.get('state');
     let next: LocalState;
     let failure: unknown;
+    const persist = () => {
+      if (!session) { records.put(next, 'state'); return; }
+      const privateRecord = records.get('community-sessions');
+      privateRecord.onsuccess = () => {
+        if (privateRecord.result !== undefined && (!privateRecord.result || typeof privateRecord.result !== 'object' || Array.isArray(privateRecord.result))) {
+          failure = new Error('Private profile storage needs review. Your saved data was preserved.'); transaction.abort(); return;
+        }
+        records.put({ ...(privateRecord.result ?? {}), [session.roomId]: { memberId: session.memberId, token: session.token } }, 'community-sessions');
+        records.put(next, 'state');
+      };
+    };
     request.onsuccess = () => {
       try {
         const raw = request.result;
@@ -59,15 +72,25 @@ export async function updateLocal(update: (previous: LocalState) => LocalState):
               failure = new Error('An existing migration backup differs. Your saved data was preserved for review.'); transaction.abort(); return;
             }
             if (backup.result === undefined) records.add(raw, 'state-v1-backup');
-            records.put(next, 'state');
+            persist();
           };
-        } else records.put(next, 'state');
+        } else persist();
       } catch (error) { failure = error; transaction.abort(); }
     };
     transaction.oncomplete = () => resolve(next);
     transaction.onerror = () => reject(transaction.error);
     transaction.onabort = () => reject(failure ?? transaction.error ?? new Error('Storage update was interrupted.'));
   });
+}
+
+export async function loadCommunitySession(roomId: string): Promise<CommunitySession | undefined> {
+  const sessions = await read<Record<string, CommunitySession>>('community-sessions');
+  if (sessions === undefined) return undefined;
+  if (!sessions || typeof sessions !== 'object' || Array.isArray(sessions)) throw new Error('Private profile storage needs review.');
+  if (!Object.hasOwn(sessions, roomId)) return undefined;
+  const session = sessions[roomId];
+  if (!session || typeof session.memberId !== 'string' || typeof session.token !== 'string' || !/^[A-Za-z0-9_-]{32,512}$/.test(session.token)) throw new Error('The saved profile session needs review.');
+  return session;
 }
 
 async function identityIfAbsent(candidate: CryptoKeyPair): Promise<CryptoKeyPair> {

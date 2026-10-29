@@ -1,6 +1,6 @@
 # Multi-action browser captures
 
-These original captures accompany the `0.1.0-preview.2` local release candidate. The matching local pipeline passed 52 domain/HTTP checks, the production build, and 16 browser-flow checks. Release publication and its workflow result are separate evidence.
+These original captures are historical evidence for `0.1.0-preview.2`, source `14f314293bfd95b04ec732b9308b65cf398f0e1f`. Its matching local pipeline passed 52 domain/HTTP checks, the production build, and 16 browser-flow checks. These counts and images do not validate the later social-planning increment. Release publication and its workflow result are separate evidence.
 
 All narrow captures are exactly **390×844**, captured with `fullPage: false`; the desktop image is **1440×1100**. The browser uses America/New_York time. They show real exercised application states, not mockups or proof of actual-phone/GPU behavior. The original preview.1 images in the parent directory remain unchanged.
 

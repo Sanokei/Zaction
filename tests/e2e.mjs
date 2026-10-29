@@ -21,7 +21,7 @@ const origin = `http://127.0.0.1:${port}`;
 let output = '';
 let browser;
 let passed = 0;
-const child = spawn(process.execPath, ['server.mjs'], {
+const child = spawn(process.execPath, ['--use-env-proxy', 'server.mjs'], {
   cwd: root,
   env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', ZACTION_DATA_FILE: join(temporary, 'demo-room.json') },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -79,24 +79,28 @@ async function openPage(context) {
   assert.ok(await page.evaluate(() => Boolean(navigator.serviceWorker.controller)));
   return page;
 }
-async function joinMember(page, memberId) {
-  await page.getByTestId('join-demo').click();
-  await page.getByTestId(`member-${memberId}`).check();
-  await page.getByTestId('confirm-join').click();
-  await eventually(async () => (await local(page))?.memberId === memberId, `join ${memberId}`);
-}
 
 const SEED = 'reading-circle';
+const planDate = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
 function target(room, id = SEED) {
   const action = room.actions.find(action => action.id === id);
   assert.ok(action, `action ${id} exists`);
   return action;
 }
 async function select(page, id, view = 'action') {
-  await navigate(page, 'home');
-  await page.getByTestId(`action-open-${id}`).click();
+  await page.evaluate(({ id, view }) => { location.hash = `${view}/${encodeURIComponent(id)}`; }, { id, view });
   await eventually(async () => (await local(page))?.selectedActionId === id, `selected action ${id}`);
-  if (view !== 'action') await navigate(page, view);
+  await page.evaluate(() => window.scrollTo({ top: 0 }));
+}
+async function closeVote(page) {
+  const close = page.getByTestId('close-demo-vote');
+  if (!await close.isVisible()) {
+    const tools = page.getByTestId('preview-vote-tools');
+    if (await tools.evaluate(element => element.tagName === 'DETAILS')) await tools.locator('summary').click();
+    else await tools.click();
+  }
+  await close.click();
+  await page.getByTestId('confirm-close').click();
 }
 async function capture(page, state, locator) {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -107,7 +111,7 @@ async function capture(page, state, locator) {
     const box = await locator.boundingBox();
     assert.ok(box && box.y > -2 && box.y < 844, `${state} evidence anchor is visible in the original viewport`);
   }
-  await page.screenshot({ path: `/tmp/zaction-v2-${state}-390x844.png`, fullPage: false });
+  await page.screenshot({ path: `/tmp/zaction-social-${state}-390x844.png`, fullPage: false });
   await page.setViewportSize({ width: 1440, height: 1100 });
 }
 async function saveBrowserRecord(page, value, key = 'state') {
@@ -123,32 +127,65 @@ async function saveBrowserRecord(page, value, key = 'state') {
     };
   }), { value, key });
 }
-const firstAction = {
-  title: 'Make the library easier to use',
-  description: 'Gather questions about access and prepare a free community reading circle.',
-  proposalTitle: 'Hold a free library-access reading session',
-  beneficiaries: 'Neighbors who use the library',
-  whenWhere: 'Proposed Saturday afternoon; location not confirmed',
-  sourceLabel: 'Member-provided discussion reference',
-  sourceUrl: 'https://example.org/library-access',
-};
-const secondAction = {
-  title: 'Plan a neighborhood access walk',
-  description: 'Compare questions about the paths people use and agree on a free accessibility walk.',
-  proposalTitle: 'Organize a free neighborhood access walk',
-  beneficiaries: 'Neighbors using public paths',
-  whenWhere: 'Proposed Sunday morning; route not confirmed',
-  sourceLabel: 'Member-provided discussion reference',
-  sourceUrl: 'https://example.org/access-walk',
-};
-const creationFields = {
-  title: 'create-title', description: 'create-description', proposalTitle: 'create-proposal-title',
-  beneficiaries: 'create-beneficiaries', whenWhere: 'create-when-where', sourceLabel: 'create-source-label', sourceUrl: 'create-source-url',
-};
-async function fillCreation(page, fields) {
-  for (const [key, value] of Object.entries(fields)) await page.getByTestId(creationFields[key]).fill(value);
+async function assertOnboardingFocus(page) {
+  assert.equal(await page.getByTestId('nav-home').count(), 0, 'feed navigation is not rendered behind onboarding');
+  assert.equal(await page.getByTestId('mobile-nav-home').count(), 0, 'mobile navigation is not rendered behind onboarding');
+  const welcome = page.locator('section[aria-label="Welcome to Zaction"]');
+  const count = await welcome.locator('button, input, select, textarea, a[href], [tabindex]').count();
+  await page.getByTestId('onboarding-name').focus();
+  for (let index = 0; index < count + 2; index++) {
+    await page.keyboard.press('Tab');
+    assert.ok(await page.evaluate(() => document.activeElement === document.body || Boolean(document.activeElement?.closest('section[aria-label="Welcome to Zaction"]'))), 'Tab cannot reach a hidden feed control while onboarding is active');
+  }
+}
+async function onboard(page, name, interests = ['bbq', 'help'], cityId = 'new-york') {
+  await page.getByTestId('onboarding-name').waitFor();
+  await page.getByTestId('onboarding-name').fill(name);
+  await page.getByTestId('onboarding-continue').click();
+  await page.getByTestId('onboarding-city').waitFor();
+  await page.getByTestId('onboarding-city').selectOption(cityId);
+  await page.getByTestId('onboarding-continue').click();
+  await page.getByTestId('onboarding-interest-bbq').waitFor();
+  for (const interest of ['bbq', 'potluck', 'games', 'walk', 'help', 'idea']) {
+    const option = page.getByTestId(`onboarding-interest-${interest}`);
+    if ((await option.getAttribute('aria-pressed') === 'true') !== interests.includes(interest)) await option.click();
+  }
+  await page.getByTestId('onboarding-finish').click();
+  await eventually(async () => {
+    const state = await local(page);
+    return Boolean(state?.community?.onboarded && state?.memberId?.startsWith('member-') &&
+      state.community.name === name && state.community.cityId === cityId &&
+      JSON.stringify([...state.community.interests].sort()) === JSON.stringify([...interests].sort()) &&
+      !await page.getByTestId('onboarding-finish').isVisible());
+  }, 'personal public profile saved without an unfinished onboarding dialog');
+}
+const weather = { mode: 'clear' };
+async function mockWeather(context) {
+  await context.route('**/api/weather?*', async route => {
+    const url = new URL(route.request().url());
+    const common = { cityId: url.searchParams.get('cityId') ?? 'new-york', date: url.searchParams.get('date') ?? planDate, sourceUrl: 'https://open-meteo.com/' };
+    const body = weather.mode === 'unavailable'
+      ? { ...common, status: 'unavailable', reason: 'Controlled test failure: weather provider is unavailable. Try again later.' }
+      : { ...common, status: 'available', checkedAt: new Date().toISOString(), temperatureMaxF: 78, temperatureMinF: 64,
+        rainChance: weather.mode === 'rain' ? 85 : 20, windMph: weather.mode === 'rain' ? 18 : 7,
+        description: weather.mode === 'rain' ? 'Rain (test forecast)' : 'Mainly clear (test forecast)', stale: false };
+    await route.fulfill({ status: 200, contentType: 'application/json', headers: { 'cache-control': 'no-store' }, body: JSON.stringify(body) });
+  });
+}
+async function fillPlan(page, kind, title, budget = '80') {
+  await navigate(page, 'home');
+  await page.getByTestId(`template-${kind}`).first().click();
+  await page.getByTestId('create-title').fill(title);
+  await page.getByTestId('create-description').fill('Bring neighbors together, share a useful conversation, and agree on accessible next steps.');
+  for (const [id, value] of [
+    ['plan-date', planDate], ['plan-location', 'Community park; exact meeting point still to be agreed'],
+    ['plan-budget', budget], ['plan-people', '8'], ['plan-rainplan', 'Use a free covered space after confirming access, or choose another day.'],
+    ['plan-accessibility', 'Step-free route and a quiet seating option'], ['plan-bringlist', 'A dish to share\nWater\nA picnic blanket'],
+  ]) await page.getByTestId(id).fill(value);
+  await page.getByTestId('plan-city').selectOption('new-york');
+  if (await page.getByTestId('create-beneficiaries').isVisible()) await page.getByTestId('create-beneficiaries').fill('Neighbors who want to meet and share ideas');
   await page.getByTestId('save-creation').click();
-  await eventually(async () => (await local(page))?.creationDraft.title === fields.title, 'creation draft saved');
+  await eventually(async () => (await local(page)).creationDraft.title === title, 'gathering draft saved');
   return (await local(page)).creationDraft.id;
 }
 
@@ -160,332 +197,407 @@ try {
   const executablePath = process.env.CHROMIUM_PATH || (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : chromium.executablePath());
   browser = await chromium.launch({ executablePath, headless: true,
     env: { ...process.env, XDG_CACHE_HOME: join(temporary, 'cache'), XDG_CONFIG_HOME: join(temporary, 'config') } });
-  const alexContext = await newContext({ viewport: { width: 1440, height: 1100 } });
-  const riverContext = await newContext({ viewport: { width: 1280, height: 1000 } });
-  const julesContext = await newContext({ viewport: { width: 1280, height: 1000 } });
-  const alex = await openPage(alexContext);
+  const mayaContext = await newContext({ viewport: { width: 390, height: 844 } });
+  const noahContext = await newContext({ viewport: { width: 1440, height: 1100 } });
+  await mockWeather(mayaContext);
+  await mockWeather(noahContext);
+  const maya = await openPage(mayaContext);
+  const font = await maya.evaluate(async () => {
+    await document.fonts.ready;
+    return {
+      applied: getComputedStyle(document.body).fontFamily.includes('Bricolage'),
+      loaded: [...document.fonts].some(face => face.family.includes('Bricolage') && face.status === 'loaded'),
+      resources: performance.getEntriesByType('resource').map(entry => entry.name).filter(url => url.includes('.woff2')),
+    };
+  });
+  assert.ok(font.applied && font.loaded, 'the self-hosted Bricolage face is applied and loaded, rather than only declared');
+  assert.ok(font.resources.length > 0, 'the browser requested the actual local font resource');
+  const fontURL = font.resources[0];
   const initial = await snapshot();
-  assert.equal(initial.schemaVersion, 2);
   assert.deepEqual(target(initial).ballots, []);
   assert.deepEqual(target(initial).contributions, []);
-  const identity = (await local(alex)).identityFingerprint;
-  assert.match(identity, /^[0-9a-f]{16}$/);
-  const manifestURL = await alex.locator('link[rel="manifest"]').getAttribute('href');
-  const manifestResponse = await fetch(new URL(manifestURL, origin));
-  assert.equal(manifestResponse.status, 200);
-  const manifest = await manifestResponse.json();
+  assert.equal(initial.profiles.filter(profile => !profile.synthetic).length, 0);
+  const manifestURL = await maya.locator('link[rel="manifest"]').getAttribute('href');
+  const manifest = await (await fetch(new URL(manifestURL, origin))).json();
   assert.equal(manifest.display, 'standalone');
-  assert.ok(manifest.icons.some(icon => icon.sizes === '192x192'));
-  assert.ok(manifest.icons.some(icon => icon.sizes === '512x512'));
-  for (const icon of manifest.icons) {
-    const response = await fetch(new URL(icon.src, origin));
-    assert.equal(response.status, 200, `manifest icon ${icon.src}`);
-    assert.ok((await response.arrayBuffer()).byteLength > 0);
+  for (const size of ['192x192', '512x512']) {
+    const icon = manifest.icons.find(icon => icon.sizes === size);
+    assert.ok(icon, `install icon ${size}`);
+    assert.ok((await fetch(new URL(icon.src, origin))).ok);
   }
-  pass('schema-v2 production app, manifest/icons, local identity and controlling service worker');
+  assert.equal(await maya.getByTestId('member-alex').count(), 0, 'new members are not asked to impersonate a fixture profile');
+  await assertOnboardingFocus(maya);
+  await capture(maya, 'onboarding');
+  await onboard(maya, 'Maya');
+  const firstLocal = await local(maya);
+  const mayaId = firstLocal.memberId;
+  const identity = firstLocal.identityFingerprint;
+  assert.equal(firstLocal.community.name, 'Maya');
+  assert.equal(firstLocal.community.cityId, 'new-york');
+  assert.ok(firstLocal.community.interests.includes('bbq'));
+  assert.ok(firstLocal.community.interests.includes('help'));
+  const sessions = await local(maya, 'community-sessions');
+  assert.equal(sessions[initial.roomId].memberId, mayaId);
+  assert.equal(typeof sessions[initial.roomId].token, 'string');
+  assert.equal(JSON.stringify(firstLocal).includes(sessions[initial.roomId].token), false);
+  await maya.reload({ waitUntil: 'networkidle' });
+  assert.equal((await local(maya)).memberId, mayaId);
+  assert.deepEqual((await local(maya)).community, firstLocal.community);
+  assert.equal((await local(maya)).identityFingerprint, identity);
+  pass('first-run setup isolates keyboard focus, loads the self-hosted typeface, and persists private preferences with a stable local identity');
 
-  const river = await openPage(riverContext);
-  const jules = await openPage(julesContext);
-  await joinMember(alex, 'alex');
-  await joinMember(river, 'river');
-  await joinMember(jules, 'jules');
-  await navigate(alex, 'home');
-  await alex.getByTestId('create-action').first().click();
-  const actionA = await fillCreation(alex, firstAction);
-  await alex.reload({ waitUntil: 'networkidle' });
-  assert.equal(await alex.getByTestId('create-title').inputValue(), firstAction.title);
-  assert.equal((await local(alex)).creationDraft.id, actionA);
-  await alexContext.setOffline(true);
-  await alex.getByTestId('publish-action').click();
-  await eventually(async () => (await local(alex))?.pending.filter(item => item.type === 'create-action').length === 1, 'offline creation queued');
+  const noah = await openPage(noahContext);
+  await onboard(noah, 'Noah', ['bbq', 'walk']);
+  const noahId = (await local(noah)).memberId;
+  assert.notEqual(mayaId, noahId);
+  const publicState = await snapshot();
+  assert.equal(publicState.profiles.filter(profile => !profile.synthetic).length, 2);
+  assert.equal(Object.hasOwn(publicState, 'sessions'), false);
+  assert.equal(Object.hasOwn(publicState.profiles.find(profile => profile.id === mayaId), 'interests'), false);
+  const browseContext = await newContext();
+  const browse = await openPage(browseContext);
+  await browse.getByTestId('onboarding-browse').click();
+  await eventually(async () => Boolean((await local(browse))?.community?.browsing), 'browse without joining');
+  assert.equal((await local(browse)).memberId, null);
+  assert.equal((await snapshot()).profiles.filter(profile => !profile.synthetic).length, 2);
+  await browseContext.close();
+  pass('two members have their own public profiles while browsing creates no invented member or social activity');
+
+  const actionA = await fillPlan(maya, 'bbq', 'Sunday neighborhood BBQ');
+  const draft = (await local(maya)).creationDraft;
+  assert.equal(draft.planning.budgetCents, 8000);
+  assert.equal(draft.planning.expectedPeople, 8);
+  assert.equal(draft.planning.kind, 'bbq');
+  assert.match(await maya.getByTestId('budget-per-person').innerText(), /\$10(?:\.00)?/);
+  await eventually(async () => /20\s*%/.test(await maya.getByTestId('weather-panel').innerText()), 'clear weather fixture shown');
+  await capture(maya, 'plan', maya.getByTestId('budget-per-person'));
+  await capture(maya, 'weather-available', maya.getByTestId('weather-panel'));
+  weather.mode = 'rain';
+  await maya.getByTestId('weather-retry').click();
+  await eventually(async () => /85\s*%/.test(await maya.getByTestId('weather-panel').innerText()), 'rain forecast fixture shown');
+  assert.match((await local(maya)).creationDraft.planning.rainPlan, /covered/);
+  weather.mode = 'unavailable';
+  await maya.getByTestId('weather-retry').click();
+  await eventually(async () => /unavailable/i.test(await maya.getByTestId('weather-panel').innerText()), 'unavailable weather fixture shown');
+  assert.doesNotMatch(await maya.getByTestId('weather-panel').innerText(), /78\s*°|20\s*%/);
+  await capture(maya, 'weather-unavailable', maya.getByTestId('weather-panel'));
+  weather.mode = 'clear';
+  pass('BBQ planning computes an $80/8 = $10 estimate, retains a rain backup, and distinguishes controlled clear/rain/unavailable weather fixtures');
+
+  await mayaContext.setOffline(true);
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await local(maya)).pending.filter(op => op.type === 'create-action').length === 1, 'offline gathering queued');
   assert.equal((await snapshot()).actions.length, 1);
-  await alex.reload({ waitUntil: 'domcontentloaded' });
-  assert.equal((await local(alex)).pending.filter(item => item.type === 'create-action').length, 1);
-  assert.equal((await local(alex)).pending.find(item => item.type === 'create-action').action.title, firstAction.title);
-  await alexContext.setOffline(false);
-  await foreground(alex);
-  await eventually(async () => (await snapshot()).actions.some(action => action.id === actionA) && !(await local(alex)).pending.length, 'created action accepted');
-  await foreground(alex);
-  await foreground(alex);
+  const offlineResponse = await maya.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok(offlineResponse.fromServiceWorker());
+  const fontResponse = maya.waitForResponse(response => response.url() === fontURL);
+  const offlineFont = await maya.evaluate(async url => {
+    await document.fonts.ready;
+    const response = await fetch(url, { cache: 'reload' });
+    return { ok: response.ok, bytes: (await response.arrayBuffer()).byteLength, type: response.headers.get('content-type'),
+      loaded: [...document.fonts].some(face => face.family.includes('Bricolage') && face.status === 'loaded') };
+  }, fontURL);
+  assert.ok(offlineFont.ok && offlineFont.bytes > 0 && offlineFont.loaded);
+  assert.match(offlineFont.type, /font\/woff2/);
+  assert.ok((await fontResponse).fromServiceWorker(), 'the production worker serves the actual font while offline');
+  assert.equal((await local(maya)).creationDraft.planning.budgetCents, 8000);
+  assert.equal((await local(maya)).pending.find(op => op.type === 'create-action').actionId, actionA);
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => (await snapshot()).actions.some(action => action.id === actionA) && !(await local(maya)).pending.length, 'authenticated gathering accepted');
+  await foreground(maya);
+  await foreground(maya);
   assert.equal((await snapshot()).actions.filter(action => action.id === actionA).length, 1);
-  assert.equal(target(await snapshot(), actionA).sourceKind, 'member-provided');
-  pass('member-authored creation draft survives reload and offline replay creates one source-labeled action');
+  assert.equal(target(await snapshot(), actionA).createdBy, mayaId);
+  assert.equal(target(await snapshot(), actionA).membershipVersion, 'COMMUNITY-PREVIEW-v1');
+  assert.equal(target(await snapshot(), actionA).planning.budgetCents, 8000);
+  pass('offline gathering creation survives the real production worker reload and reconnects exactly once as its actual author');
 
-  await navigate(alex, 'create');
-  await alex.getByTestId('start-another-action').click();
-  const actionB = await fillCreation(alex, secondAction);
-  assert.notEqual(actionA, actionB);
-  await alex.getByTestId('publish-action').click();
-  await eventually(async () => (await snapshot()).actions.length === 3 && !(await local(alex)).pending.length, 'second independent authored action accepted');
-  await navigate(alex, 'home');
-  await alex.getByTestId(`action-open-${actionA}`).waitFor();
-  await alex.getByTestId(`action-open-${actionB}`).waitFor();
-  await alex.screenshot({ path: '/tmp/zaction-v2-home-desktop.png', fullPage: false });
-  assert.equal(target(await snapshot()).contributions.length, 0, 'the original reading circle is untouched');
-  pass('two member-authored actions coexist with the preserved seed and can be selected independently');
+  const actionB = await fillPlan(maya, 'potluck', 'Bring-and-share neighborhood supper', '40');
+  await maya.getByTestId('publish-action').click();
+  await eventually(async () => (await snapshot()).actions.length === 3 && !(await local(maya)).pending.length, 'second authored gathering accepted');
+  await navigate(maya, 'home');
+  await foreground(noah);
+  await eventually(async () => (await local(noah)).snapshot.actions.some(action => action.id === actionB), 'second member sees gathering');
+  await maya.getByTestId('feed-category-bbq').click();
+  assert.equal(await maya.getByTestId(`action-card-${actionA}`).count(), 1);
+  assert.equal(await maya.getByTestId(`action-card-${actionB}`).count(), 0);
+  await maya.getByTestId('feed-category-all').click();
+  await maya.getByTestId('feed-search').fill('neighborhood BBQ');
+  assert.equal(await maya.getByTestId(`action-card-${actionA}`).count(), 1);
+  assert.equal(await maya.getByTestId(`action-card-${actionB}`).count(), 0);
+  await maya.getByTestId('feed-search').fill('');
+  await maya.getByTestId('feed-city').selectOption('austin');
+  assert.equal(await maya.getByTestId(`action-card-${actionA}`).count(), 0);
+  await maya.getByTestId('feed-city').selectOption('new-york');
+  await maya.getByTestId(`save-${actionA}`).click();
+  await eventually(async () => (await local(maya)).savedActionIds.includes(actionA), 'plan saved privately');
+  await navigate(maya, 'saved');
+  await maya.reload({ waitUntil: 'networkidle' });
+  await maya.getByTestId(`action-card-${actionA}`).waitFor();
+  assert.equal(((await local(noah)).savedActionIds ?? []).includes(actionA), false);
+  assert.equal(Object.hasOwn(await snapshot(), 'savedActionIds'), false);
+  await navigate(maya, 'home');
+  await maya.setViewportSize({ width: 1440, height: 1100 });
+  await maya.screenshot({ path: '/tmp/zaction-social-feed-desktop.png', fullPage: false });
+  await capture(maya, 'feed', maya.getByTestId(`action-card-${actionA}`));
+  pass('community feed filters actual posts by activity/search/city and privately saved plans persist without sharing another member’s saves');
 
-  const discussionA = 'Library action: could we bring a plain-language handout?';
-  const discussionB = 'Access walk: could we include step-free paths and rest stops?';
-  await select(alex, actionA);
-  await alex.getByTestId('contribution-input').fill(discussionA);
-  await alex.getByTestId('save-draft').click();
-  await eventually(async () => (await local(alex)).drafts[actionA]?.discussion === discussionA, 'first keyed discussion draft saved');
-  await select(alex, actionB);
-  await alex.getByTestId('contribution-input').fill(discussionB);
-  await alex.getByTestId('save-draft').click();
-  await eventually(async () => (await local(alex)).drafts[actionB]?.discussion === discussionB, 'second keyed discussion draft saved');
-  await select(alex, actionA);
-  assert.equal(await alex.getByTestId('contribution-input').inputValue(), discussionA);
-  await alexContext.setOffline(true);
-  const offlineNavigation = await alex.reload({ waitUntil: 'domcontentloaded' });
-  assert.ok(offlineNavigation.fromServiceWorker());
-  assert.equal(await alex.getByTestId('contribution-input').inputValue(), discussionA);
-  assert.equal((await local(alex)).identityFingerprint, identity);
-  await select(alex, actionB);
-  assert.equal(await alex.getByTestId('contribution-input').inputValue(), discussionB);
-  pass('per-action discussion drafts survive switching, actual offline worker reload, and identity restoration');
+  await maya.getByTestId(`reaction-${actionA}`).click();
+  await eventually(async () => target(await snapshot(), actionA).reactions.length === 1, 'first member interested');
+  await noah.getByTestId(`reaction-${actionA}`).click();
+  await eventually(async () => target(await snapshot(), actionA).reactions.length === 2, 'second member interested');
+  await foreground(maya);
+  await eventually(async () => target((await local(maya)).snapshot, actionA).reactions.length === 2, 'reaction state reconciled');
+  await maya.getByTestId(`reaction-${actionA}`).click();
+  await eventually(async () => target(await snapshot(), actionA).reactions.length === 1, 'interest toggled off');
+  await maya.getByTestId(`reaction-${actionA}`).click();
+  await eventually(async () => target(await snapshot(), actionA).reactions.length === 2, 'interest toggled back on');
+  await maya.getByTestId(`rsvp-going-${actionA}`).click();
+  await noah.getByTestId(`rsvp-maybe-${actionA}`).click();
+  await eventually(async () => target(await snapshot(), actionA).rsvps.length === 2, 'independent RSVP records');
+  assert.equal(target(await snapshot(), actionA).ballots.length, 0);
+  assert.equal(target(await snapshot(), actionB).reactions.length, 0);
+  assert.equal(target(await snapshot(), actionB).rsvps.length, 0);
+  pass('interest toggles and individual RSVPs synchronize across real profiles without adding ballots or changing another plan');
 
-  await select(alex, actionA);
-  await alex.getByTestId('publish-contribution').click();
-  await select(alex, actionB);
-  await alex.getByTestId('publish-contribution').click();
-  await eventually(async () => (await local(alex)).pending.filter(item => item.type === 'contribute').length === 2, 'two target-specific contributions queued');
-  await alexContext.setOffline(false);
-  await foreground(alex);
-  await foreground(river);
-  await eventually(async () => target(await snapshot(), actionA).contributions.length === 1 && target(await snapshot(), actionB).contributions.length === 1, 'independent contributions accepted');
-  await eventually(async () => (await local(river)).snapshot.actions.some(action => action.id === actionB), 'second browser sees authored actions');
-  assert.equal(target(await snapshot(), actionA).contributions[0].text, discussionA);
-  assert.equal(target(await snapshot(), actionB).contributions[0].text, discussionB);
-  assert.equal(target(await snapshot()).contributions.length, 0);
-  pass('offline publication and reconnect route each discussion to its original action exactly once');
+  await select(maya, actionA);
+  const question = 'I can bring vegetarian dishes. Is there a covered space nearby?';
+  await maya.getByTestId('contribution-input').fill(question);
+  await maya.getByTestId('publish-contribution').click();
+  await eventually(async () => target(await snapshot(), actionA).contributions.length === 1, 'first public comment accepted');
+  const parent = target(await snapshot(), actionA).contributions[0];
+  assert.equal(parent.memberId, mayaId);
+  await foreground(noah);
+  await select(noah, actionA);
+  const reply = 'I can check the covered seating and step-free access.';
+  await noah.getByTestId(`reply-open-${parent.id}`).click();
+  await noah.getByTestId(`reply-input-${parent.id}`).fill(reply);
+  await noahContext.setOffline(true);
+  await noah.getByTestId(`reply-submit-${parent.id}`).click();
+  await eventually(async () => (await local(noah)).pending.some(op => op.type === 'contribute' && op.parentId === parent.id), 'reply queued against its parent');
+  await noah.reload({ waitUntil: 'domcontentloaded' });
+  assert.ok((await local(noah)).pending.some(op => op.parentId === parent.id && op.actionId === actionA));
+  await noahContext.setOffline(false);
+  await foreground(noah);
+  await eventually(async () => target(await snapshot(), actionA).contributions.length === 2, 'offline reply accepted');
+  const storedReply = target(await snapshot(), actionA).contributions.find(comment => comment.parentId === parent.id);
+  assert.equal(storedReply.text, reply);
+  assert.equal(storedReply.memberId, noahId);
+  assert.equal(target(await snapshot(), actionB).contributions.length, 0);
+  pass('threaded replies retain their original parent, action and author through offline queue/reload/reconnect');
 
-  await select(alex, actionA, 'proposal');
-  await alex.getByTestId('choice-approve').check();
-  await capture(alex, 'open', alex.getByTestId('ballot-action-title'));
-  await alexContext.setOffline(true);
-  await alex.getByTestId('submit-vote').click();
-  await alex.getByTestId('pending-status').waitFor();
-  await capture(alex, 'pending', alex.getByTestId('ballot-action-title'));
-  await select(alex, actionB, 'proposal');
-  await alex.getByTestId('choice-approve').check();
-  await alex.getByTestId('submit-vote').click();
-  await eventually(async () => (await local(alex)).pending.filter(item => item.type === 'vote').length === 2, 'independent ballot intents queued');
+  await select(maya, actionB);
+  const secondDraft = 'The supper should also have a quiet participation option.';
+  await maya.getByTestId('contribution-input').fill(secondDraft);
+  await maya.getByTestId('save-draft').click();
+  await eventually(async () => (await local(maya)).drafts[actionB]?.discussion === secondDraft, 'second discussion draft saved');
+  await select(maya, actionA, 'proposal');
+  await maya.getByTestId('choice-approve').check();
+  await mayaContext.setOffline(true);
+  await maya.getByTestId('submit-vote').click();
+  await maya.getByTestId('pending-status').waitFor();
+  await capture(maya, 'pending', maya.getByTestId('ballot-action-title'));
+  await select(maya, actionB, 'proposal');
+  await maya.getByTestId('choice-approve').check();
+  await maya.getByTestId('submit-vote').click();
+  await maya.reload({ waitUntil: 'domcontentloaded' });
+  await eventually(async () => (await local(maya)).pending.filter(op => op.type === 'vote').length === 2, 'two distinct ballot intents retained');
   assert.equal(target(await snapshot(), actionA).ballots.length, 0);
   assert.equal(target(await snapshot(), actionB).ballots.length, 0);
-  await alex.reload({ waitUntil: 'domcontentloaded' });
-  await alex.getByTestId('pending-status').waitFor();
-  assert.equal((await local(alex)).pending.filter(item => item.type === 'vote').length, 2);
-  pass('two offline ballots retain explicit targets across reload without incrementing accepted totals');
-
   for (const id of [actionA, actionB]) {
-    const progress = (await local(river)).progress[id] ?? { read: false, reviewed: false };
-    assert.deepEqual(progress, { read: false, reviewed: false });
-    await select(river, id, 'proposal');
-    await river.getByTestId('choice-approve').check();
-    await river.getByTestId('submit-vote').click();
-    await eventually(async () => target(await snapshot(), id).ballots.length === 1, `same zero-progress member votes in ${id}`);
+    assert.deepEqual((await local(noah)).progress[id] ?? { read: false, reviewed: false }, { read: false, reviewed: false });
+    await select(noah, id, 'proposal');
+    await noah.getByTestId('choice-approve').check();
+    await noah.getByTestId('submit-vote').click();
+    await eventually(async () => target(await snapshot(), id).ballots.length === 1, 'one equal community ballot accepted');
   }
-  await select(river, actionA, 'proposal');
-  await river.getByTestId('close-demo-vote').click();
-  await river.getByTestId('confirm-close').click();
-  await eventually(async () => target(await snapshot(), actionA).outcome === 'no-quorum', 'first action closes without quorum');
+  await select(noah, actionA, 'proposal');
+  await closeVote(noah);
+  await eventually(async () => target(await snapshot(), actionA).outcome === 'no-quorum', 'one gathering vote closes independently');
   assert.equal(target(await snapshot(), actionB).outcome, 'open');
-  await alexContext.setOffline(false);
-  await foreground(alex);
-  await eventually(async () => {
-    const state = await local(alex);
-    return state.pending.length === 0 && state.receipts.some(item => item.type === 'vote' && item.actionId === actionA && !item.accepted);
-  }, 'one offline target rejected while the other is accepted');
+  await mayaContext.setOffline(false);
+  await foreground(maya);
+  await eventually(async () => (await local(maya)).pending.length === 0, 'pending ballots reconciled');
   assert.equal(target(await snapshot(), actionA).ballots.length, 1);
   assert.equal(target(await snapshot(), actionB).ballots.length, 2);
-  await foreground(alex);
-  await foreground(alex);
-  assert.equal(target(await snapshot(), actionB).ballots.filter(item => item.memberId === 'alex').length, 1);
-  pass('one action closes independently; reconnect rejects only its late ballot and accepts the other once at equal weight');
+  assert.equal(target(await snapshot(), actionA).reactions.length, 2);
+  assert.equal(target(await snapshot(), actionA).rsvps.length, 2);
 
-  await select(alex, actionA, 'proposal');
-  await alex.reload({ waitUntil: 'networkidle' });
-  const rejection = (await local(alex)).receipts.find(item => item.type === 'vote' && item.actionId === actionA && !item.accepted);
-  assert.equal(rejection.operation.actionId, actionA);
-  assert.equal(rejection.operation.choice, 'approve');
-  const rejectedRow = alex.locator('[data-submission-status="rejected"]').filter({ hasText: /approve/i }).first();
-  await rejectedRow.waitFor();
-  assert.match(await rejectedRow.innerText(), /not accepted|rejected/i);
-  await capture(alex, 'rejected', alex.getByTestId('submission-history'));
-  await select(alex, actionB, 'proposal');
-  assert.equal(await alex.locator('[data-submission-status="rejected"]').count(), 0);
-  pass('rejected original choice and action survive reload and cannot leak into another action’s history');
+  const profileCount = (await snapshot()).profiles.length;
+  const sessionBeforeEdit = (await local(maya, 'community-sessions'))[initial.roomId];
+  await navigate(maya, 'profile');
+  await maya.getByRole('button', { name: 'Your preferences', exact: true }).click();
+  await assertOnboardingFocus(maya);
+  await onboard(maya, 'Maya', ['walk', 'potluck'], 'austin');
+  assert.equal((await local(maya)).memberId, mayaId);
+  assert.equal((await snapshot()).profiles.length, profileCount, 'editing preferences does not mint another member');
+  assert.equal((await snapshot()).profiles.find(profile => profile.id === mayaId).cityId, 'austin');
+  const sessionAfterEdit = (await local(maya, 'community-sessions'))[initial.roomId];
+  assert.equal(sessionAfterEdit.memberId, sessionBeforeEdit.memberId);
+  assert.ok(sessionAfterEdit.token === sessionBeforeEdit.token, 'the existing private capability retains its owner');
+  assert.equal(Object.hasOwn((await snapshot()).profiles.find(profile => profile.id === mayaId), 'interests'), false);
+  const currentRoom = await snapshot();
+  const currentBallotTarget = target(currentRoom, actionB);
+  const duplicateResponse = await fetch(`${origin}/api/operations`, {
+    method: 'POST', headers: { 'content-type': 'application/json', Authorization: `Bearer ${sessionAfterEdit.token}` },
+    body: JSON.stringify({ id: randomUUID(), memberId: mayaId, type: 'vote', actionId: actionB, choice: 'oppose',
+      roomId: currentRoom.roomId, proposalRevision: currentBallotTarget.proposalRevision,
+      rulesVersion: currentBallotTarget.rulesVersion, membershipVersion: currentBallotTarget.membershipVersion }),
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal((await duplicateResponse.json()).receipt.accepted, false, 'editing city/interests cannot grant a second ballot');
+  assert.equal(target(await snapshot(), actionB).ballots.filter(ballot => ballot.memberId === mayaId).length, 1);
+  await maya.getByRole('button', { name: 'Your preferences', exact: true }).click();
+  await onboard(maya, 'Maya', ['bbq', 'help'], 'new-york');
+  assert.equal((await local(maya)).memberId, mayaId);
+  assert.equal((await snapshot()).profiles.length, profileCount);
 
-  await foreground(jules);
-  await eventually(async () => (await local(jules)).snapshot.actions.some(action => action.id === actionB), 'third browser has second action');
-  await select(jules, actionB, 'proposal');
-  await jules.getByTestId('choice-abstain').check();
-  await jules.getByTestId('submit-vote').click();
-  await eventually(async () => target(await snapshot(), actionB).ballots.length === 3, 'third equal ballot accepted');
-  await select(river, actionB, 'proposal');
-  await river.getByTestId('close-demo-vote').click();
-  await river.getByTestId('confirm-close').click();
-  await eventually(async () => target(await snapshot(), actionB).outcome === 'adopted', 'second action adopted');
-  assert.equal(target(await snapshot(), actionA).outcome, 'no-quorum');
-  assert.equal(target(await snapshot()).outcome, 'open');
-  pass('distinct action outcomes coexist and the untouched seed remains open');
+  await select(maya, actionA, 'proposal');
+  await maya.reload({ waitUntil: 'networkidle' });
+  const rejected = (await local(maya)).receipts.find(receipt => receipt.type === 'vote' && receipt.actionId === actionA && !receipt.accepted);
+  assert.equal(rejected.operation.choice, 'approve');
+  assert.equal(rejected.operation.actionId, actionA);
+  await capture(maya, 'rejected', maya.getByTestId('submission-history'));
+  await select(noah, actionB, 'proposal');
+  await closeVote(noah);
+  await eventually(async () => target(await snapshot(), actionB).outcome === 'adopted', 'second plan adopted with equal ballots');
+  pass('community decisions remain separate from social signals and preference edits: members keep one equal ballot, one late intent is rejected and another plan adopts');
 
-  const notesA = 'Library action: no quorum. Keep the source questions and prepare a revised proposal.';
-  const notesB = 'Access walk: plan adopted. Confirm accessibility before making any outside commitment.';
-  await foreground(alex);
-  await select(alex, actionA, 'proposal');
-  await alex.getByTestId('minutes-input').fill(notesA);
-  await eventually(async () => (await local(alex)).drafts[actionA]?.minutes === notesA, 'first action minutes draft saved');
-  await select(alex, actionB, 'proposal');
-  await alex.getByTestId('minutes-input').fill(notesB);
-  await eventually(async () => (await local(alex)).drafts[actionB]?.minutes === notesB, 'second action minutes draft saved');
-  await alex.reload({ waitUntil: 'networkidle' });
-  assert.equal(await alex.getByTestId('minutes-input').inputValue(), notesB);
-  await select(alex, actionA, 'proposal');
-  assert.equal(await alex.getByTestId('minutes-input').inputValue(), notesA);
-  await alex.getByTestId('publish-minutes').click();
-  await eventually(async () => target(await snapshot(), actionA).minutes.length === 1, 'first minutes published');
-  assert.equal(target(await snapshot(), actionB).minutes.length, 0);
-  await select(alex, actionB, 'proposal');
-  assert.equal(await alex.getByTestId('minutes-input').inputValue(), notesB);
-  await alex.getByTestId('publish-minutes').click();
-  await eventually(async () => target(await snapshot(), actionB).minutes.length === 1, 'second minutes published');
-  const corrected = notesB + ' Correction: no location has been booked.';
-  await alex.getByTestId('minutes-input').fill(corrected);
-  await alex.getByTestId('publish-minutes').click();
-  await eventually(async () => target(await snapshot(), actionB).minutes.length === 2, 'second action correction appended');
-  assert.equal(target(await snapshot(), actionA).minutes[0].text, notesA);
-  assert.equal(target(await snapshot(), actionB).minutes[0].text, notesB);
-  pass('separate minutes drafts survive switching/reload and publication/corrections stay action-local');
+  await select(maya, actionA, 'proposal');
+  const notesA = 'The BBQ proposal did not reach quorum. Its social interest and RSVPs did not approve it.';
+  await maya.getByTestId('minutes-input').fill(notesA);
+  await maya.getByTestId('save-minutes-draft').click();
+  await select(maya, actionB, 'proposal');
+  const notesB = 'The supper plan was adopted. Confirm access and the estimated budget before making commitments.';
+  await maya.getByTestId('minutes-input').fill(notesB);
+  await maya.getByTestId('save-minutes-draft').click();
+  await maya.reload({ waitUntil: 'networkidle' });
+  assert.equal(await maya.getByTestId('minutes-input').inputValue(), notesB);
+  await maya.getByTestId('publish-minutes').click();
+  await eventually(async () => target(await snapshot(), actionB).minutes.length === 1, 'member publishes decision notes');
+  await select(maya, actionA, 'proposal');
+  assert.equal(await maya.getByTestId('minutes-input').inputValue(), notesA);
+  assert.equal(target(await snapshot(), actionA).minutes.length, 0);
+  await maya.getByTestId('publish-minutes').click();
+  await eventually(async () => target(await snapshot(), actionA).minutes.length === 1, 'other plan minutes published separately');
+  pass('action-specific discussion and minutes drafts persist and human publication never changes another plan’s records');
 
-  const storageContext = await newContext({ viewport: { width: 390, height: 844 } });
-  const storagePage = await openPage(storageContext);
-  await joinMember(storagePage, 'alex');
-  await select(storagePage, actionA);
-  const unsaved = 'Keep this action-specific question visible when storage fails.';
-  await storagePage.evaluate(() => {
+  await select(maya, actionA);
+  const authText = 'Retain this comment while the test transport rejects its authorization.';
+  let interceptedId;
+  await mayaContext.route('**/api/operations', async route => {
+    const op = route.request().postDataJSON();
+    if (op.type !== 'contribute' || op.text !== authText) return route.continue();
+    interceptedId = op.id;
+    await route.fulfill({ status: 401, contentType: 'application/json', body: JSON.stringify({
+      receipt: { id: op.id, actionId: op.actionId, type: op.type, accepted: false, reason: 'Your private community session needs recovery.', receivedAt: new Date().toISOString() }, snapshot: await snapshot(),
+    }) });
+  });
+  await maya.getByTestId('contribution-input').fill(authText);
+  await maya.getByTestId('publish-contribution').click();
+  await eventually(async () => Boolean(interceptedId && (await local(maya)).receipts.some(receipt => receipt.id === interceptedId && !receipt.accepted)), 'authorization rejection retains the original operation in history');
+  const authRejection = (await local(maya)).receipts.find(receipt => receipt.id === interceptedId);
+  assert.equal(authRejection.operation.text, authText);
+  assert.equal(authRejection.operation.actionId, actionA);
+  await mayaContext.unroute('**/api/operations');
+  await maya.reload({ waitUntil: 'networkidle' });
+  await select(maya, actionA, 'proposal');
+  await maya.locator('[data-submission-status="rejected"]').filter({ hasText: authText }).getByTestId('recover-submission').click();
+  assert.equal(await maya.getByTestId('contribution-input').inputValue(), authText);
+  await maya.getByTestId('publish-contribution').click();
+  await eventually(async () => target(await snapshot(), actionA).contributions.some(comment => comment.text === authText), 'recovered authenticated submission accepted');
+  assert.equal(target(await snapshot(), actionA).contributions.filter(comment => comment.text === authText).length, 1);
+  assert.equal((await local(maya)).receipts.find(receipt => receipt.id === interceptedId).accepted, false);
+  pass('a controlled authorization rejection preserves the original submission across reload and explicit recovery publishes one copy to its original plan');
+
+  const unsaved = 'Keep this question visible if the local browser cannot save it.';
+  await maya.evaluate(() => {
     const original = IDBObjectStore.prototype.put;
     window.__restoreZactionPut = () => { IDBObjectStore.prototype.put = original; };
     IDBObjectStore.prototype.put = function () { throw new DOMException('Simulated quota exceeded', 'QuotaExceededError'); };
   });
   try {
-    await storagePage.getByTestId('contribution-input').fill(unsaved);
-    await storagePage.getByTestId('save-draft').click();
-    await storagePage.getByText(/Could not save on this device/).first().waitFor();
-    assert.equal(await storagePage.getByTestId('contribution-input').inputValue(), unsaved);
-    assert.notEqual((await local(storagePage)).drafts[actionA]?.discussion, unsaved);
-    await capture(storagePage, 'recovery', storagePage.locator('.composer-card'));
-  } finally { await storagePage.evaluate(() => window.__restoreZactionPut()); }
-  await storagePage.getByTestId('save-draft').click();
-  await eventually(async () => (await local(storagePage)).drafts[actionA]?.discussion === unsaved, 'draft saved after recovery');
-  await storagePage.locator('.composer-card .field-meta [role="status"]').filter({ hasText: 'Saved on this device' }).waitFor();
-  await capture(storagePage, 'storage-recovered', storagePage.locator('.composer-card'));
-  await storageContext.close();
-  pass('failed local writes preserve input, show recovery, and save to the original action after retry');
+    await maya.getByTestId('contribution-input').fill(unsaved);
+    await maya.getByTestId('save-draft').click();
+    await maya.getByText(/Could not save on this device/).first().waitFor();
+    assert.equal(await maya.getByTestId('contribution-input').inputValue(), unsaved);
+    assert.notEqual((await local(maya)).drafts[actionA]?.discussion, unsaved);
+    await capture(maya, 'recovery', maya.locator('.comment-composer'));
+  } finally { await maya.evaluate(() => window.__restoreZactionPut()); }
+  await maya.getByTestId('save-draft').click();
+  await eventually(async () => (await local(maya)).drafts[actionA]?.discussion === unsaved, 'storage recovered without losing input');
+  pass('quota failures preserve unsaved input and recover into the original plan without claiming a successful save');
 
-  const sharedContext = await newContext();
-  const firstTab = await openPage(sharedContext);
-  await joinMember(firstTab, 'river');
-  const secondTab = await openPage(sharedContext);
-  await select(firstTab, actionA);
+  const secondTab = await openPage(mayaContext);
+  await select(maya, actionA);
   await select(secondTab, actionB);
-  await sharedContext.setOffline(true);
-  await firstTab.getByTestId('contribution-input').fill('Tab one: keep the library question attached to its action.');
-  await secondTab.getByTestId('contribution-input').fill('Tab two: keep the access-walk question attached to its action.');
-  assert.equal(await firstTab.getByTestId('active-action-title').innerText(), firstAction.title, 'another tab cannot retarget the first editor');
-  assert.equal(await secondTab.getByTestId('active-action-title').innerText(), secondAction.title, 'each tab keeps its own active action');
-  await Promise.all([firstTab.getByTestId('publish-contribution').click(), secondTab.getByTestId('publish-contribution').click()]);
-  await eventually(async () => (await local(firstTab)).pending.filter(item => item.type === 'contribute').length === 2, 'two tabs retain both action targets');
-  await sharedContext.setOffline(false);
-  await foreground(firstTab);
+  const beforeA = target(await snapshot(), actionA).contributions.length;
+  const beforeB = target(await snapshot(), actionB).contributions.length;
+  await mayaContext.setOffline(true);
+  await maya.getByTestId('contribution-input').fill('First tab: preserve the BBQ target.');
+  await secondTab.getByTestId('contribution-input').fill('Second tab: preserve the supper target.');
+  assert.match(await maya.getByTestId('active-action-title').innerText(), /Sunday neighborhood BBQ/);
+  assert.match(await secondTab.getByTestId('active-action-title').innerText(), /Bring-and-share neighborhood supper/);
+  await Promise.all([maya.getByTestId('publish-contribution').click(), secondTab.getByTestId('publish-contribution').click()]);
+  await eventually(async () => (await local(maya)).pending.filter(op => op.type === 'contribute').length === 2, 'two authenticated tabs retain both targets');
+  await mayaContext.setOffline(false);
+  await foreground(maya);
   await foreground(secondTab);
-  await eventually(async () => target(await snapshot(), actionA).contributions.length === 2 && target(await snapshot(), actionB).contributions.length === 2 && (await local(firstTab)).pending.length === 0, 'two tabs reconcile each target exactly once');
-  await sharedContext.close();
-  pass('simultaneous tabs cannot clobber another action’s durable submission queue');
+  await eventually(async () => target(await snapshot(), actionA).contributions.length === beforeA + 1 && target(await snapshot(), actionB).contributions.length === beforeB + 1 && !(await local(maya)).pending.length, 'two tabs synchronize exact targets');
+  await secondTab.close();
+  pass('authenticated simultaneous tabs preserve independent draft targets and durable queues without duplicates');
 
-  const migrationContext = await newContext();
-  const migrationPage = await openPage(migrationContext);
-  const beforeMigration = await local(migrationPage);
-  const currentRoom = await snapshot();
-  const originalSeed = target(currentRoom);
-  const legacyRoomId = 'a-previously-used-demo-room';
-  const legacySnapshot = { schemaVersion: 1, roomId: legacyRoomId,
-    proposalRevision: 1, rulesVersion: originalSeed.rulesVersion, membershipVersion: originalSeed.membershipVersion,
-    closesAt: originalSeed.closesAt, contributions: originalSeed.contributions, ballots: originalSeed.ballots,
-    outcome: originalSeed.outcome, closedAt: originalSeed.closedAt, minutes: originalSeed.minutes, completedTasks: originalSeed.completedTasks };
-  const pendingLegacy = { id: randomUUID(), memberId: 'jules', type: 'vote', choice: 'abstain',
-    roomId: legacyRoomId, proposalRevision: 1, rulesVersion: originalSeed.rulesVersion, membershipVersion: originalSeed.membershipVersion };
-  const legacyContribution = { ...pendingLegacy, id: randomUUID(), type: 'contribute', text: 'Restore this submitted legacy question to its original reading-circle draft.' };
-  const legacyReceiptOperation = { ...pendingLegacy, id: randomUUID(), type: 'contribute', text: 'A preserved legacy question.' };
-  const legacy = { memberId: 'jules', snapshot: legacySnapshot, draft: 'Preserve this previous discussion draft.',
-    progress: { read: true, reviewed: false }, pending: [pendingLegacy, legacyContribution],
-    receipts: [{ id: legacyReceiptOperation.id, accepted: true, reason: 'Accepted by the demo room.',
-      receivedAt: new Date().toISOString(), type: 'contribute', operation: legacyReceiptOperation }],
-    lastSync: new Date().toISOString(), identityFingerprint: beforeMigration.identityFingerprint };
-  await migrationContext.setOffline(true);
-  await saveBrowserRecord(migrationPage, legacy);
-  await migrationPage.reload({ waitUntil: 'domcontentloaded' });
-  await eventually(async () => (await local(migrationPage))?.schemaVersion === 2, 'browser v1 migration completed');
-  const migrated = await local(migrationPage);
-  assert.equal(migrated.selectedActionId, SEED);
-  assert.equal(migrated.snapshot.roomId, legacySnapshot.roomId);
-  assert.equal(migrated.drafts[SEED].discussion, legacy.draft);
-  assert.deepEqual(migrated.progress[SEED], legacy.progress);
-  assert.equal(migrated.pending[0].actionId, SEED);
-  assert.equal(migrated.pending[0].id, pendingLegacy.id);
-  assert.equal(migrated.receipts[0].actionId, SEED);
-  assert.equal(migrated.receipts[0].operation.actionId, SEED);
-  assert.equal(migrated.identityFingerprint, beforeMigration.identityFingerprint);
-  assert.deepEqual(await local(migrationPage, 'state-v1-backup'), legacy);
-  await migrationPage.reload({ waitUntil: 'domcontentloaded' });
-  assert.deepEqual(await local(migrationPage, 'state-v1-backup'), legacy);
-  pass('existing browser v1 data migrates with its identity, draft, progress, target-tagged queue/history and exact backup intact');
+  const legacyContext = await newContext();
+  const legacyPage = await openPage(legacyContext);
+  const oldState = await local(legacyPage);
+  const room = await snapshot();
+  const seed = target(room);
+  const legacySnapshot = { schemaVersion: 1, roomId: room.roomId, proposalRevision: 1, rulesVersion: seed.rulesVersion,
+    membershipVersion: seed.membershipVersion, closesAt: seed.closesAt, contributions: seed.contributions, ballots: seed.ballots,
+    outcome: seed.outcome, closedAt: seed.closedAt, minutes: seed.minutes, completedTasks: seed.completedTasks };
+  const legacy = { memberId: 'jules', snapshot: legacySnapshot, draft: 'Preserve this old discussion draft.', progress: { read: true, reviewed: false },
+    pending: [], receipts: [], lastSync: null, identityFingerprint: oldState.identityFingerprint };
+  await legacyContext.setOffline(true);
+  await saveBrowserRecord(legacyPage, legacy);
+  await legacyPage.reload({ waitUntil: 'domcontentloaded' });
+  await eventually(async () => (await local(legacyPage)).schemaVersion === 2, 'legacy browser record migrated');
+  assert.equal((await local(legacyPage)).drafts[SEED].discussion, legacy.draft);
+  assert.deepEqual((await local(legacyPage)).progress[SEED], legacy.progress);
+  assert.equal((await local(legacyPage)).identityFingerprint, oldState.identityFingerprint);
+  assert.deepEqual(await local(legacyPage, 'state-v1-backup'), legacy);
+  await legacyContext.close();
+  pass('legacy browser identity, discussion, progress and exact migration backup survive the community upgrade');
 
-  await migrationContext.setOffline(false);
-  await foreground(migrationPage);
-  await eventually(async () => (await local(migrationPage)).pending.length === 0 && (await local(migrationPage)).receipts.some(item => item.id === legacyContribution.id && !item.accepted), 'old-room submissions rejected with original target');
-  await select(migrationPage, actionA);
-  const unrelated = 'This separate library-action draft must not be replaced by recovery.';
-  await migrationPage.getByTestId('contribution-input').fill(unrelated);
-  await migrationPage.getByTestId('save-draft').click();
-  await eventually(async () => (await local(migrationPage)).drafts[actionA]?.discussion === unrelated, 'unrelated action draft safely saved');
-  await select(migrationPage, SEED, 'proposal');
-  const recoverRow = migrationPage.locator('[data-submission-status="rejected"]').filter({ hasText: legacyContribution.text });
-  await recoverRow.getByTestId('recover-submission').click();
-  await eventually(async () => (await local(migrationPage)).selectedActionId === SEED && (await local(migrationPage)).drafts[SEED]?.discussion === legacyContribution.text, 'rejected contribution restored to original action');
-  assert.equal(await migrationPage.getByTestId('contribution-input').inputValue(), legacyContribution.text);
-  assert.equal((await local(migrationPage)).drafts[actionA].discussion, unrelated);
-  assert.ok((await local(migrationPage)).receipts.some(item => item.id === legacyContribution.id && !item.accepted));
-  await capture(migrationPage, 'restored', migrationPage.locator('.composer-card'));
-  await migrationContext.close();
-  pass('rejected text can be explicitly recovered into its original action without changing another action’s draft or receipt');
+  if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
+    // This context has no weather routes. Its observed provider result is kept
+    // separate from deterministic fixture checks and never increments PASS.
+    const observedContext = await newContext();
+    const observedPage = await openPage(observedContext);
+    await onboard(observedPage, 'Weather QA', []);
+    let observed;
+    observedPage.on('response', async response => {
+      if (new URL(response.url()).pathname === '/api/weather') {
+        try { observed = await response.json(); } catch { /* UI surfaces the request failure. */ }
+      }
+    });
+    await fillPlan(observedPage, 'bbq', 'Weather observation draft', '0');
+    await eventually(async () => ['available', 'unavailable'].includes(observed?.status), 'unmocked weather route observation', 20000);
+    await eventually(async () => !/Checking the forecast/.test(await observedPage.getByTestId('weather-status').innerText()), 'observed weather rendered');
+    await capture(observedPage, 'weather-observed', observedPage.getByTestId('weather-panel'));
+    console.log(`OBSERVED: unmocked weather route returned ${observed.status}; screenshot /tmp/zaction-social-weather-observed-390x844.png. This observation is separate from fixture PASS counts.`);
+    await observedContext.close();
+  }
 
-  const corruptContext = await newContext();
-  const corruptPage = await openPage(corruptContext);
-  const corruptRecord = { malformed: true, draft: 42, pending: 'corrupt-sentinel' };
-  await saveBrowserRecord(corruptPage, corruptRecord);
-  await corruptPage.reload({ waitUntil: 'networkidle' });
-  await corruptPage.getByText(/Browser storage could not be opened|Saved data needs review/).first().waitFor();
-  await navigate(corruptPage, 'action');
-  assert.equal(await corruptPage.getByTestId('contribution-input').count(), 0, 'unsafe local data does not expose a misleading composer');
-  await corruptPage.getByRole('button', { name: 'Retry group updates', exact: true }).click();
-  await pause(200);
-  assert.deepEqual(await local(corruptPage), corruptRecord);
-  assert.equal(await corruptPage.getByText(/^Draft saved on this device/).count(), 0);
-  await corruptContext.close();
-  pass('corrupt browser records remain unchanged and unsafe editing stays unavailable through recovery retries');
-
-  const mobileContext = await newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  const mobile = await openPage(mobileContext);
-  assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
-  await mobile.screenshot({ path: '/tmp/zaction-v2-home-390x844.png', fullPage: false });
-  await select(mobile, actionB, 'proposal');
-  assert.ok(await mobile.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
-  await mobileContext.close();
-  assert.deepEqual(pageErrors, [], 'no uncaught JavaScript errors in any scenario');
-  pass('multi-action desktop/mobile UI remains responsive without uncaught JavaScript errors');
-  console.log(`Completed ${passed} schema-v2 production browser checks. No real-phone, GPU, encrypted messaging, or official election-vote validation is claimed.`);
+  await navigate(maya, 'home');
+  await maya.setViewportSize({ width: 390, height: 844 });
+  assert.ok(await maya.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+  await maya.screenshot({ path: '/tmp/zaction-social-feed-final-390x844.png', fullPage: false });
+  await select(maya, actionB, 'proposal');
+  assert.ok(await maya.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
+  assert.deepEqual(pageErrors, [], 'community flows completed without uncaught page errors');
+  pass('community feed and decision screens fit the original mobile viewport without uncaught JavaScript errors');
+  console.log(`Completed ${passed} community-preview production browser checks. Forecast display used controlled TEST fixtures; no live-provider, phone, GPU, encryption, or official-election validation is claimed.`);
 } catch (error) {
   if (output) console.error('Test server output:', output.trim());
   throw error;

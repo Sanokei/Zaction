@@ -35,6 +35,9 @@ jobs:
       - run: npm run build
       - run: npx playwright-core install --with-deps chromium
       - run: npm run test:e2e
+      - name: Observe the live weather provider
+        continue-on-error: true
+        run: npm run check:weather
       - run: npm run release:package
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -69,15 +72,19 @@ jobs:
             exit 1
           fi
           cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
-          A runnable public-demo PWA with member-authored $0 actions and proposals, separate discussions and drafts, equal-weight group votes, and recorded outcomes. Personal progress and shared milestones stay scoped to each action and do not increase voting power. Member-provided sources are public and unverified.
+          A runnable community PWA preview with public-pseudonym onboarding, a social feed, illustrated plan templates, comments/replies, interest signals, private saves, and going/maybe RSVPs. Members can plan a BBQ, potluck, games, walk, practical help, or civic idea. Templates are suggestions, not fabricated events or crowds.
 
-          Creation and shared submissions can be saved offline and remain pending until server acceptance. Existing first-preview room and browser data migrate into the multi-action schema without reset; the server preserves a v1 backup before conversion. Read the hosting instructions before upgrading an existing room.
+          Per-person cost estimates support planning without payments or bookings. Open-Meteo forecast lookup has explicit unavailable, stale, and out-of-range states; weather data is never invented. Live-provider access is separate from controlled integration tests and must be assessed from the actual release evidence.
 
-          Download the web ZIP and SHA256SUMS, verify and extract it, then run `node server.mjs` with Node.js 24. Open the locally served site and use the browser's installation menu. Public hosting requires HTTPS and the same-origin demonstration API. The ZIP is a ready-to-host web build, not a native installer.
+          Proposal ballots remain separate from reactions and RSVPs. Eligible profiles each have equal voting weight; profile count is not proof of unique people. Personal progress and shared milestones do not increase that weight. Member content and sources remain public and unverified.
 
-          Validation: frozen dependency install, domain tests, production build, and Chromium browser flows completed for this tagged source in this release workflow. See the workflow run for the actual checks; counts from earlier preview releases are historical evidence only.
+          Creation and shared submissions can be saved offline and remain pending until server acceptance. Existing room/browser data and legacy fixture history are preserved with additive migration. Private session credentials stay out of public state and release assets. Read the hosting instructions before upgrading or moving an existing room.
 
-          This is a synthetic public demonstration, not production membership or decentralized voting infrastructure. No on-device GPU/phone validation, Qwen inference, E2EE, or licensed civic-data integration is established by this release. Model downloads are not bundled.
+          Download the web ZIP and SHA256SUMS, verify and extract it, then run `node --use-env-proxy server.mjs` with Node.js 24.5+. Open the locally served site and use the browser's installation menu. Public hosting requires HTTPS and the same-origin preview API. The ZIP is a ready-to-host web build, not a native installer. Bricolage Grotesque is bundled offline with its OFL license; no font CDN is required.
+
+          Validation: frozen dependency install, domain tests, production build, and Chromium browser flows completed for this tagged source in this release workflow. See the workflow run for the actual checks; counts from earlier preview releases are historical evidence only. The separate live-weather observation is nonblocking and can warn/fail while the workflow succeeds: inspect its actual notice or warning before claiming provider access.
+
+          This public preview is not production membership or decentralized voting infrastructure. No on-device GPU/phone validation, Qwen inference, E2EE, payment custody, or licensed election-data integration is established by this release. Model downloads are not bundled. A downloadable build is not evidence of a reachable hosted deployment.
           NOTES
           printf '\nSource commit: `%s`\n' "$SOURCE_COMMIT" >> "$RUNNER_TEMP/release-notes.md"
           release_flags=()
