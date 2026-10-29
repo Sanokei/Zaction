@@ -12,7 +12,7 @@ let local: LocalState = emptyLocal();
 // The stored last selection is a startup default, not cross-tab navigation.
 // Each open tab keeps its own route target while sharing durable records.
 let activeActionId = local.selectedActionId;
-const views: View[] = ['home', 'plans', 'saved', 'profile', 'create', 'edit', 'action', 'proposal', 'progress', 'learn'];
+const views: View[] = ['home', 'plans', 'saved', 'help', 'profile', 'create', 'edit', 'action', 'proposal', 'progress', 'learn'];
 function currentRoute(): { view: View; id?: string } | null {
   const [view, encodedId] = location.hash.slice(1).split('/');
   if (!views.includes(view as View)) return null;
@@ -160,7 +160,7 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
   let duplicate = false;
   const saved = await mutate(previous => {
     const sameAuthorTransition = ['change-plan', 'cancel-plan'].includes(type) && previous.pending.some(item => ['change-plan', 'cancel-plan'].includes(item.type) && item.actionId === actionId && item.memberId === operation.memberId);
-    if (sameAuthorTransition || type === 'bring-item' && previous.pending.some(item => item.type === type && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
+    if (sameAuthorTransition || type === 'bring-item' && previous.pending.some(item => item.type === type && item.roomId === operation.roomId && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
       duplicate = true;
       return previous;
     }

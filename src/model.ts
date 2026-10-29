@@ -1,6 +1,6 @@
 export type MemberId = string;
 export type Choice = 'approve' | 'oppose' | 'abstain';
-export type View = 'home' | 'plans' | 'saved' | 'profile' | 'create' | 'edit' | 'action' | 'proposal' | 'progress' | 'learn';
+export type View = 'home' | 'plans' | 'saved' | 'help' | 'profile' | 'create' | 'edit' | 'action' | 'proposal' | 'progress' | 'learn';
 export type Outcome = 'open' | 'adopted' | 'not-adopted' | 'no-quorum';
 export const DEFAULT_ACTION_ID = 'reading-circle';
 export const MEMBERS: { id: MemberId; name: string; color: string }[] = [

@@ -30,9 +30,15 @@ Bring & share adds an optional `bringClaims` collection to each action within sc
 
 Each immutable published `planning.bring` entry is a distinct slot identified by action ID and its original item index. Duplicate labels are separate slots. A single member may offer several items, but each slot has only one accepted owner. This increment provides no editing/reordering, quantities, shared ownership, payment, or automatic assignment; do not reorder published entries in the backing file as a workaround.
 
-The server serializes claims. A release must match the acting owner and the exact currently accepted claim ID, so a delayed offline release cannot remove a later reclaim. Stable retries return the original receipt. Pending claims do not reserve an item, pending releases do not free it, and the confirmed owner remains visible until acceptance. A conflict is a rejected receipt: the member reviews current availability before a deliberate new attempt.
+The server serializes claims. A release must match the acting owner and the exact currently accepted claim ID, so a delayed offline release cannot remove a later reclaim. Stable retries return the original receipt. Pending claims do not reserve an item, pending releases do not free it, and the recorded owner remains visible until acceptance. A conflict is a rejected receipt: the member reviews current availability before a deliberate new attempt.
 
 The public nickname and item intention are visible to the room. Accepted offers do not change voting weight, ballots, going/maybe RSVPs, private progress, task completion, or verified attendance/delivery. They are statements of intent; no notification, purchase, or booking is performed.
+
+## Help discovery and return
+
+Feed availability and **My help** reuse the existing item/task slots, accepted claims, pending operations, and receipts. There is no backend, schema, or confirmation-state migration, and no second ledger to move or back up. The return view is scoped to the selected profile and room; it links to the exact original plan and numbered slot, including cancelled/superseded history. A successor does not inherit an offer.
+
+Cached availability is provisional until synchronization. Pending offers do not reserve a slot, pending withdrawals do not free it, and rejected attempts stay distinct from shared offers. A withdrawal still requires the exact current claim on its original plan. Public nicknames and item/task intentions are visible; server acceptance is not organizer confirmation, readiness, attendance, delivery, or completion. These views add no vote/RSVP/progress effects, shift/hour tracking, notifications, or new assignment power.
 
 ## Author changes, cancellation, and preserved history
 

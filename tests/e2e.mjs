@@ -241,7 +241,7 @@ async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, no
   assert.ok(await originalButton.evaluate(element => element.isConnected && element === document.activeElement), 'the same native button keeps focus after its command becomes release');
   assert.equal(await originalButton.getAttribute('data-testid'), `bring-release-${actionC}-0`);
   await foreground(noah);
-  await eventually(async () => /Maya plans to bring/.test(await status(noah, actionC, 0).innerText()), 'other profile sees the actual accepted owner');
+  await eventually(async () => /Maya offered to help/.test(await status(noah, actionC, 0).innerText()), 'other profile sees the actual accepted owner');
   assert.equal(await release(noah, actionC, 0).count(), 0, 'another member is not offered a release control');
   await claim(noah, actionC, 1).focus();
   await noah.keyboard.press('Space');
@@ -255,7 +255,7 @@ async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, no
   await select(maya, actionC);
   await maya.getByTestId('bring-refresh').focus();
   await maya.keyboard.press('Enter');
-  await eventually(async () => /Noah plans to bring/.test(await status(maya, actionC, 1).innerText()), 'manual availability refresh reconciles the duplicate slot');
+  await eventually(async () => /Noah offered to help/.test(await status(maya, actionC, 1).innerText()), 'manual availability refresh reconciles the duplicate slot');
   assert.ok(await maya.getByTestId('bring-refresh').evaluate(element => element === document.activeElement), 'availability refresh does not steal keyboard focus');
   await captureBring(maya, 'claimed');
   await maya.getByTestId('bring-items').evaluate(element => element.scrollIntoView({ block: 'start' }));
@@ -269,7 +269,7 @@ async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, no
   assert.equal(pendingClaim.intent, 'claim');
   assert.equal(pendingClaim.memberId, mayaId);
   assert.match(await status(maya, actionC, 2).innerText(), /Available/);
-  assert.match(await status(maya, actionC, 2).innerText(), /Offer saved on this device.*waiting to be accepted/s);
+  assert.match(await status(maya, actionC, 2).innerText(), /Offer saved on this device.*waiting to be shared/s);
   assert.equal((await claims()).some(item => item.itemIndex === 2), false, 'queued offers do not reserve on the server');
   const offlineClaimReload = await maya.reload({ waitUntil: 'domcontentloaded' });
   assert.ok(offlineClaimReload.fromServiceWorker());
@@ -286,13 +286,13 @@ async function verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, no
   await eventually(async () => (await local(maya)).pending.some(op => op.type === 'bring-item' && op.intent === 'release' && op.itemIndex === 2), 'offline release queued');
   const pendingRelease = (await local(maya)).pending.find(op => op.type === 'bring-item' && op.intent === 'release');
   assert.equal(pendingRelease.claimId, pendingClaim.id, 'release targets the exact accepted claim');
-  assert.match(await status(maya, actionC, 2).innerText(), /You plan to bring this/);
-  assert.match(await status(maya, actionC, 2).innerText(), /Release saved on this device.*waiting to be accepted/s);
+  assert.match(await status(maya, actionC, 2).innerText(), /Your offer is shared/);
+  assert.match(await status(maya, actionC, 2).innerText(), /Withdrawal saved on this device.*waiting to be shared/s);
   assert.equal((await claims()).find(item => item.itemIndex === 2).id, pendingClaim.id, 'queued release does not free accepted ownership');
   const offlineReleaseReload = await maya.reload({ waitUntil: 'domcontentloaded' });
   assert.ok(offlineReleaseReload.fromServiceWorker());
   await eventually(async () => (await local(maya)).pending.some(op => op.id === pendingRelease.id), 'offline release keeps its exact claim and operation IDs');
-  assert.match(await status(maya, actionC, 2).innerText(), /You plan to bring this/);
+  assert.match(await status(maya, actionC, 2).innerText(), /Your offer is shared/);
   await captureBring(maya, 'pending-release', row(maya, actionC, 2));
   await mayaContext.setOffline(false);
   await foreground(maya);
@@ -983,6 +983,253 @@ async function verifyScheduleWeather(otherViewer) {
   } finally { await context.close(); }
 }
 
+async function captureHelp(page, state, locator) {
+  const previousViewport = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} help handoff is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'help discovery and return states fit the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-help-${state}-390x844.png`, fullPage: false });
+  if (previousViewport) await page.setViewportSize(previousViewport);
+}
+
+async function verifyHelpHandoff() {
+  const organizerContext = await newContext({ viewport: { width: 1440, height: 1100 } });
+  const helperContext = await newContext({ viewport: { width: 390, height: 844 } });
+  await mockWeather(organizerContext);
+  await mockWeather(helperContext);
+  try {
+    const organizer = await openPage(organizerContext);
+    await onboard(organizer, 'Kai', ['help']);
+    const task = 'Welcome people at the step-free entrance';
+    const requests = [task, task, 'Bring drinking water'];
+    const first = await fillPlan(organizer, 'bbq', 'Courtyard welcome · practical help', '0', requests);
+    await organizer.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === first) && !(await local(organizer)).pending.length, 'first plan with actual practical needs published');
+    const second = await fillPlan(organizer, 'potluck', 'Library supper · practical help', '0', requests);
+    await organizer.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === second) && !(await local(organizer)).pending.length, 'independent plan with duplicate labels published');
+    const helper = await openPage(helperContext);
+    await helper.getByTestId('onboarding-browse').click();
+    await eventually(async () => Boolean((await local(helper)).community?.browsing), 'newcomer can discover needs before joining');
+    await navigate(helper, 'help');
+    await helper.getByTestId('help-empty').waitFor();
+    assert.equal((await local(helper)).memberId, null);
+    await navigate(helper, 'home');
+    await captureHelp(helper, 'discovery', helper.getByTestId(`help-feed-${first}`).locator('..'));
+    const discoveryControl = await helper.getByTestId(`help-feed-${first}`).boundingBox();
+    assert.ok(discoveryControl && discoveryControl.y >= 0 && discoveryControl.y + discoveryControl.height < 774, 'the actual help-discovery control is visible above mobile navigation in the original capture');
+    await helper.getByTestId(`help-feed-${first}`).focus();
+    await helper.keyboard.press('Enter');
+    await eventually(async () => (await local(helper)).selectedActionId === first && helper.getByTestId('bring-items').locator('h2').evaluate(element => element === document.activeElement), 'feed help handoff focuses the original list heading');
+    const claim = (page, id, index) => page.getByTestId(`bring-claim-${id}-${index}`);
+    const release = (page, id, index) => page.getByTestId(`bring-release-${id}-${index}`);
+    const row = (page, id, index) => page.getByTestId(`bring-row-${id}-${index}`);
+    const entry = (page, id, index) => page.getByTestId(`help-entry-${id}-${index}`);
+    const owner = (page, id, index) => page.getByTestId(`help-owner-${id}-${index}`);
+    const myHelp = async page => { await navigate(page, 'help'); await page.getByRole('heading', { name: 'My help', exact: true }).waitFor(); };
+    const openExact = async (page, id, index, key = 'Enter') => {
+      await page.getByTestId(`help-open-${id}-${index}`).focus();
+      await page.keyboard.press(key);
+      await eventually(async () => (await local(page)).selectedActionId === id && row(page, id, index).evaluate(element => element === document.activeElement), 'My help returns focus to the exact original numbered slot');
+    };
+    await claim(helper, first, 0).click();
+    await onboard(helper, 'Ren', ['help']);
+    const helperId = (await local(helper)).memberId;
+    const organizerId = (await local(organizer)).memberId;
+    const room = await snapshot();
+    await claim(helper, first, 0).focus();
+    await helper.keyboard.press('Enter');
+    await eventually(async () => target(await snapshot(), first).bringClaims.some(item => item.itemIndex === 0 && item.memberId === helperId) && !(await local(helper)).pending.length, 'newcomer deliberately shares an offer after joining');
+    const firstSharedId = target(await snapshot(), first).bringClaims[0].id;
+    await myHelp(helper);
+    await entry(helper, first, 0).waitFor();
+    assert.match(await entry(helper, first, 0).innerText(), /Courtyard welcome/);
+    assert.match(await entry(helper, first, 0).innerText(), /Welcome people at the step-free entrance/);
+    assert.match(await owner(helper, first, 0).innerText(), /Ren|Your|You/);
+    assert.equal(await entry(helper, first, 1).count(), 0, 'a duplicate label is a separate unoffered slot');
+    await helper.reload({ waitUntil: 'networkidle' });
+    await entry(helper, first, 0).waitFor();
+    assert.equal(target((await local(helper)).snapshot, first).bringClaims[0].id, firstSharedId);
+    await captureHelp(helper, 'shared', helper.getByTestId(`help-plan-${first}`));
+    await helper.setViewportSize({ width: 1440, height: 1100 });
+    await helper.getByTestId('help-list').evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await helper.screenshot({ path: '/tmp/zaction-help-shared-desktop.png', fullPage: false });
+    await helper.setViewportSize({ width: 390, height: 844 });
+    await select(organizer, first);
+    await foreground(organizer);
+    await eventually(async () => /Ren offered to help/.test(await organizer.getByTestId(`bring-status-${first}-0`).innerText()), 'organizer sees the current owner and remaining open duplicate need');
+    assert.match(await organizer.getByTestId(`bring-status-${first}-1`).innerText(), /Available/);
+    await captureHelp(organizer, 'organizer-open-needs', organizer.getByTestId('bring-items'));
+    await openExact(helper, first, 0);
+    await release(helper, first, 0).focus();
+    await helper.keyboard.press('Space');
+    await eventually(async () => !target(await snapshot(), first).bringClaims.length && !(await local(helper)).pending.length, 'keyboard withdrawal releases the exact original offer');
+    await myHelp(helper);
+    await helper.getByTestId('help-empty').waitFor();
+    assert.equal((await local(helper)).receipts.find(receipt => receipt.id === firstSharedId).accepted, true, 'withdrawing clears current help without erasing original receipts');
+    pass('a newcomer discovers a practical need, joins deliberately, returns through My help after reload and withdraws the exact offer with the keyboard');
+
+    await helperContext.setOffline(true);
+    const beforeForeign = await local(helper);
+    const original = target(beforeForeign.snapshot, first);
+    const foreignOperation = { id: randomUUID(), type: 'bring-item', actionId: first, memberId: helperId, roomId: 'another-room',
+      proposalRevision: original.proposalRevision, rulesVersion: original.rulesVersion, membershipVersion: original.membershipVersion,
+      itemIndex: 0, intent: 'claim' };
+    const foreignRejectedOperation = { ...foreignOperation, id: randomUUID() };
+    await saveBrowserRecord(helper, { ...beforeForeign, pending: [...beforeForeign.pending, foreignOperation], receipts: [...beforeForeign.receipts,
+      { id: foreignRejectedOperation.id, type: 'bring-item', actionId: first, accepted: false, receivedAt: new Date().toISOString(), reason: 'Foreign-room rejection must stay out of current help.', operation: foreignRejectedOperation }] });
+    const foreignReload = await helper.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(foreignReload.fromServiceWorker());
+    await helper.getByTestId('help-empty').waitFor();
+    await select(helper, first);
+    assert.match(await helper.getByTestId(`bring-status-${first}-0`).innerText(), /Available/);
+    assert.doesNotMatch(await helper.getByTestId(`bring-status-${first}-0`).innerText(), /Foreign-room|waiting/);
+    await claim(helper, first, 0).click();
+    await eventually(async () => (await local(helper)).pending.some(op => op.type === 'bring-item' && op.actionId === first && op.roomId === room.roomId && op.itemIndex === 0), 'current-room offer can queue alongside a foreign-room record');
+    assert.ok((await local(helper)).pending.some(op => op.id === foreignOperation.id), 'queueing does not drop the original foreign-room operation');
+    await select(helper, second);
+    await claim(helper, second, 0).click();
+    await eventually(async () => (await local(helper)).pending.filter(op => op.type === 'bring-item' && op.roomId === room.roomId).length === 2, 'two exact current-room offers durably queued');
+    const pendingOffers = (await local(helper)).pending.filter(op => op.type === 'bring-item' && op.roomId === room.roomId);
+    await myHelp(helper);
+    assert.equal(await helper.locator('[data-testid^="help-entry-"]').count(), 2, 'My help excludes another room while distinguishing both current targets');
+    assert.doesNotMatch(await helper.getByTestId('help-list').innerText(), /Foreign-room rejection/);
+    for (const id of [first, second]) {
+      assert.match(await entry(helper, id, 0).innerText(), /waiting|pending/i);
+      assert.match(await owner(helper, id, 0).innerText(), /Available|No.*offer|open/i);
+      assert.equal(target(await snapshot(), id).bringClaims.length, 0, 'pending help does not reserve a public slot');
+    }
+    const pendingReload = await helper.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(pendingReload.fromServiceWorker());
+    assert.deepEqual((await local(helper)).pending.filter(op => op.roomId === room.roomId).map(op => [op.id, op.actionId]).sort(), pendingOffers.map(op => [op.id, op.actionId]).sort());
+    await captureHelp(helper, 'pending-offer', helper.getByTestId(`help-plan-${first}`));
+    await select(organizer, first);
+    await claim(organizer, first, 0).click();
+    await eventually(async () => target(await snapshot(), first).bringClaims.some(item => item.memberId === organizerId), 'another member fills one originally open need');
+    await helperContext.setOffline(false);
+    await foreground(helper);
+    await eventually(async () => {
+      const state = await local(helper);
+      return !state.pending.length && pendingOffers.every(op => state.receipts.some(receipt => receipt.id === op.id));
+    }, 'both current intents and the foreign backlog receive exact receipts');
+    const rejected = pendingOffers.find(op => op.actionId === first);
+    const shared = pendingOffers.find(op => op.actionId === second);
+    assert.equal((await local(helper)).receipts.find(receipt => receipt.id === rejected.id).accepted, false);
+    assert.equal((await local(helper)).receipts.find(receipt => receipt.id === shared.id).accepted, true);
+    assert.equal((await local(helper)).receipts.find(receipt => receipt.id === foreignOperation.id).operation.roomId, 'another-room');
+    await myHelp(helper);
+    await eventually(async () => /Kai/.test(await owner(helper, first, 0).innerText()), 'conflict shows the current public owner on its original plan');
+    assert.match(await entry(helper, first, 0).innerText(), /not shared|not accepted|conflict/i);
+    assert.match(await owner(helper, second, 0).innerText(), /Ren|Your|You/);
+    await helper.reload({ waitUntil: 'networkidle' });
+    await captureHelp(helper, 'conflict', helper.getByTestId(`help-plan-${first}`));
+    await release(organizer, first, 0).click();
+    await eventually(async () => !target(await snapshot(), first).bringClaims.length, 'current owner deliberately withdraws');
+    await foreground(helper);
+    await eventually(async () => /Available|No.*offer|open/i.test(await owner(helper, first, 0).innerText()), 'rejected helper can review the newly open original need');
+    await openExact(helper, first, 0);
+    await claim(helper, first, 0).focus();
+    await helper.keyboard.press('Enter');
+    await eventually(async () => target(await snapshot(), first).bringClaims.some(item => item.memberId === helperId) && !(await local(helper)).pending.length, 'reviewed retry creates a new shared offer');
+    assert.notEqual(target(await snapshot(), first).bringClaims[0].id, rejected.id);
+    assert.equal((await local(helper)).receipts.find(receipt => receipt.id === rejected.id).accepted, false);
+    await myHelp(helper);
+    await captureHelp(helper, 'retry', helper.getByTestId(`help-plan-${first}`));
+    await myHelp(organizer);
+    await organizer.getByTestId('help-empty').waitFor();
+    assert.equal(await organizer.locator('[data-testid^="help-entry-"]').count(), 0, 'another profile never inherits this member’s offers');
+    pass('My help separates duplicate cross-plan needs and foreign-room records through offline reload, conflict and an explicit reviewed retry');
+
+    await openExact(helper, second, 0, 'Space');
+    const secondClaim = target(await snapshot(), second).bringClaims[0];
+    await helperContext.setOffline(true);
+    await release(helper, second, 0).click();
+    await eventually(async () => (await local(helper)).pending.some(op => op.type === 'bring-item' && op.actionId === second && op.intent === 'release' && op.claimId === secondClaim.id), 'exact withdrawal durably queued');
+    const withdrawal = (await local(helper)).pending.find(op => op.type === 'bring-item' && op.actionId === second && op.intent === 'release');
+    await myHelp(helper);
+    assert.match(await owner(helper, second, 0).innerText(), /Ren|Your|You/);
+    assert.match(await entry(helper, second, 0).innerText(), /withdraw|release/i);
+    assert.equal(target(await snapshot(), second).bringClaims[0].id, secondClaim.id, 'pending withdrawal keeps the public shared owner');
+    const withdrawalReload = await helper.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(withdrawalReload.fromServiceWorker());
+    assert.ok((await local(helper)).pending.some(op => op.id === withdrawal.id && op.claimId === secondClaim.id));
+    await captureHelp(helper, 'pending-withdrawal', helper.getByTestId(`help-plan-${second}`));
+    await helperContext.setOffline(false);
+    await foreground(helper);
+    await eventually(async () => !target(await snapshot(), second).bringClaims.length && !(await local(helper)).pending.length && !await entry(helper, second, 0).count(), 'accepted withdrawal clears only its own current My help entry');
+    assert.equal(await entry(helper, first, 0).count(), 1);
+    assert.equal(target(await snapshot(), first).bringClaims[0].memberId, helperId);
+    pass('My help preserves the actual owner during offline withdrawal and clears only the exact entry after acceptance');
+
+    await select(organizer, first);
+    await organizer.getByTestId(`plan-update-${first}`).click();
+    const changeReason = 'Move the welcome to a new arrangement; earlier offers stay with the original until people choose again.';
+    await organizer.getByTestId('create-title').fill('Courtyard welcome · revised arrangement');
+    await organizer.getByTestId('change-reason').fill(changeReason);
+    await organizer.getByTestId('save-plan-change').click();
+    await eventually(async () => (await local(organizer)).planChangeDrafts[first]?.change.reason === changeReason, 'replacement reason durably saved');
+    const successorId = (await local(organizer)).planChangeDrafts[first].id;
+    await organizer.getByTestId('publish-plan-change').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === successorId) && !(await local(organizer)).pending.length, 'replacement listing accepted');
+    assert.deepEqual(target(await snapshot(), successorId).bringClaims, []);
+    await foreground(helper);
+    await myHelp(helper);
+    await eventually(async () => (await helper.getByTestId(`help-plan-${first}`).innerText()).includes(changeReason), 'My help preserves original offer and change reason as historical');
+    assert.match(await entry(helper, first, 0).innerText(), /historical/i);
+    await captureHelp(helper, 'historical-change', helper.getByTestId(`help-plan-${first}`));
+    await select(helper, successorId);
+    await claim(helper, successorId, 0).click();
+    await eventually(async () => target(await snapshot(), successorId).bringClaims.some(item => item.memberId === helperId), 'helper independently offers the same task on the new plan');
+    const successorClaim = target(await snapshot(), successorId).bringClaims[0];
+    await myHelp(helper);
+    await openExact(helper, first, 0);
+    await release(helper, first, 0).click();
+    await eventually(async () => !target(await snapshot(), first).bringClaims.length && !(await local(helper)).pending.length, 'historical original offer explicitly withdrawn');
+    assert.equal(target(await snapshot(), successorId).bringClaims[0].id, successorClaim.id);
+    await select(organizer, successorId);
+    await organizer.getByTestId(`plan-cancel-${successorId}`).click();
+    const cancelReason = 'The space is unavailable. Keep the recorded offers historical while a fresh proposal is considered.';
+    await organizer.getByTestId('cancel-reason').fill(cancelReason);
+    await organizer.getByTestId('confirm-cancel').click();
+    await eventually(async () => target(await snapshot(), successorId).lifecycle.status === 'cancelled' && !(await local(organizer)).pending.length, 'replacement listing cancelled without deleting the recorded offer');
+    await organizer.getByTestId(`plan-again-${successorId}`).click();
+    await organizer.getByTestId('change-reason').fill('Try a fresh welcome proposal after confirming a workable venue with people.');
+    await organizer.getByTestId('save-plan-change').click();
+    await eventually(async () => Boolean((await local(organizer)).planChangeDrafts[successorId]?.change.reason), 'new attempt reason saved');
+    const restartedId = (await local(organizer)).planChangeDrafts[successorId].id;
+    await organizer.getByTestId('publish-plan-change').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === restartedId) && !(await local(organizer)).pending.length, 'fresh proposal linked to the cancelled original');
+    assert.deepEqual(target(await snapshot(), restartedId).bringClaims, []);
+    await foreground(helper);
+    await myHelp(helper);
+    await eventually(async () => (await helper.getByTestId(`help-plan-${successorId}`).innerText()).includes(cancelReason), 'cancelled original reason remains visible in My help');
+    assert.match(await entry(helper, successorId, 0).innerText(), /historical/i);
+    await captureHelp(helper, 'historical-cancelled', helper.getByTestId(`help-plan-${successorId}`));
+    await captureHelp(helper, 'historical-offer', entry(helper, successorId, 0));
+    await helper.getByTestId(`help-plan-${successorId}`).getByTestId(`lifecycle-successor-${successorId}`).click();
+    await eventually(async () => (await local(helper)).selectedActionId === restartedId, 'successor navigation is explicit and transfers no offer');
+    assert.equal(target(await snapshot(), restartedId).bringClaims.length, 0);
+    await myHelp(helper);
+    await openExact(helper, successorId, 0);
+    await release(helper, successorId, 0).click();
+    await eventually(async () => !target(await snapshot(), successorId).bringClaims.length && !(await local(helper)).pending.length, 'cancelled offer remains withdrawable on its original ID');
+    for (const id of [first, second, successorId, restartedId]) {
+      const action = target(await snapshot(), id);
+      assert.deepEqual(action.ballots, []);
+      assert.deepEqual(action.rsvps, []);
+      assert.deepEqual(action.reactions, []);
+      assert.equal(action.outcome, 'open');
+      assert.deepEqual((await local(helper)).progress[id] ?? { read: false, reviewed: false }, { read: false, reviewed: false });
+    }
+    assert.deepEqual(pageErrors, []);
+    pass('My help identifies cancelled and replaced offers as historical, links fresh proposals without transferring consent and withdraws only original claims');
+  } finally { await helperContext.close(); await organizerContext.close(); }
+}
+
 try {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(`Server exited: ${output}`);
@@ -991,6 +1238,10 @@ try {
   const executablePath = process.env.CHROMIUM_PATH || (existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : chromium.executablePath());
   browser = await chromium.launch({ executablePath, headless: true,
     env: { ...process.env, XDG_CACHE_HOME: join(temporary, 'cache'), XDG_CONFIG_HOME: join(temporary, 'config') } });
+  if (process.env.ZACTION_E2E_SCOPE === 'help') {
+    await verifyHelpHandoff();
+    console.log(`Completed ${passed} focused help handoff production browser checks.`);
+  } else {
   const mayaContext = await newContext({ viewport: { width: 390, height: 844 } });
   const noahContext = await newContext({ viewport: { width: 1440, height: 1100 } });
   await mockWeather(mayaContext);
@@ -1373,6 +1624,7 @@ try {
   await verifyBringItems(maya, mayaContext, mayaId, noah, noahContext, noahId);
   await verifyPlanLifecycle(maya, mayaContext, mayaId, noah, noahContext, noahId);
   await verifyScheduleWeather(maya);
+  await verifyHelpHandoff();
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept
@@ -1404,6 +1656,7 @@ try {
   assert.deepEqual(pageErrors, [], 'community flows completed without uncaught page errors');
   pass('community feed and decision screens fit the original mobile viewport without uncaught JavaScript errors');
   console.log(`Completed ${passed} community-preview production browser checks. Forecast display used controlled TEST fixtures; no live-provider, phone, GPU, encryption, or official-election validation is claimed.`);
+  }
 } catch (error) {
   if (process.env.GITHUB_ACTIONS === 'true') {
     // Public annotations expose the failing check/frame without dumping saved
