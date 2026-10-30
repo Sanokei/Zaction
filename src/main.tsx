@@ -7,6 +7,7 @@ import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, contentKindFor, com
 import { emptyLocal, loadLocal, loadCommunitySession, updateLocal, type SessionChange } from './store';
 import { parseSnapshot, validActionId, validChangeContext } from './migrations';
 import { sourceFor, validSourceRefShape } from '../civic-sources.mjs';
+import { commentStateFor, localReceiptFor, resetPostedComment, type CommentContext } from './comments';
 
 const root = createRoot(document.getElementById('root')!);
 let local: LocalState = emptyLocal();
@@ -97,6 +98,11 @@ const acceptedMessages: Record<Operation['type'], string> = {
 };
 
 function acceptedMessage(operation: Operation, snapshot: DemoSnapshot) {
+  if (operation.type === 'contribute') {
+    const target = snapshot.roomId === operation.roomId ? snapshot.actions.find(action => action.id === operation.actionId) : undefined;
+    const verified = target?.contributions.some(comment => comment.id === operation.id && comment.memberId === operation.memberId && (comment.parentId ?? null) === (operation.parentId ?? null) && comment.text === operation.text?.trim());
+    return verified ? operation.parentId ? 'Your reply is posted.' : 'Your comment is posted.' : 'Your receipt is recorded. Refresh the discussion to verify the exact comment; your text is kept.';
+  }
   const target = operation.type === 'create-action' || operation.type === 'change-plan' ? operation.action : snapshot.actions.find(action => action.id === operation.actionId);
   const kind = contentKindFor(target);
   if (kind === 'discussion') {
@@ -129,16 +135,23 @@ async function synchronize(): Promise<void> {
       if (!navigator.onLine) { updateRuntime({ connectivity: 'offline' }); break; }
       const result = await request('/api/operations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pending) }, pending.memberId);
       const nextSnapshot = parseSnapshot(result.snapshot);
-      const receipt: Receipt = result.receipt;
-      if (!receipt || receipt.id !== pending.id || receipt.actionId !== pending.actionId || typeof receipt.accepted !== 'boolean') throw new Error('The demo room returned an invalid receipt. Your pending action was preserved.');
+      const incoming: Receipt = result.receipt;
+      if (!incoming || incoming.id !== pending.id || incoming.actionId !== pending.actionId || incoming.type !== pending.type || typeof incoming.accepted !== 'boolean' || typeof incoming.reason !== 'string' || typeof incoming.receivedAt !== 'string' || !Number.isFinite(Date.parse(incoming.receivedAt))) throw new Error('The demo room returned an invalid receipt. Your pending action was preserved.');
+      // Only server receipt facts cross this boundary. Local composer markers
+      // come from the existing wrapper for the exact original receipt/op.
+      const receipt: Receipt = { id: incoming.id, actionId: incoming.actionId, type: incoming.type, accepted: incoming.accepted, reason: incoming.reason, receivedAt: incoming.receivedAt };
       const saved = await mutate(previous => {
         const field = pending.type === 'minutes' ? 'minutes' : 'discussion';
         const draft = draftsFor(previous, pending.actionId);
-        const restore = !receipt.accepted && ['contribute', 'minutes'].includes(pending.type) && !draft[field];
+        // Comment text is retained on submission. A later rejection must not
+        // refill an intentionally cleared/newer composer or change its target.
+        // Original text remains in the receipt's explicit recovery control.
+        const restore = !receipt.accepted && pending.type === 'minutes' && !draft[field];
+        const localReceipt = localReceiptFor(previous.receipts, receipt, pending);
         return {
           ...previous, snapshot: latestSnapshot(previous.snapshot, nextSnapshot), lastSync: new Date().toISOString(),
           pending: previous.pending.filter(item => item.id !== pending.id),
-          receipts: [...previous.receipts.filter(item => item.id !== receipt.id), { ...receipt, operation: pending }],
+          receipts: [...previous.receipts.filter(item => item.id !== receipt.id), localReceipt],
           drafts: restore ? { ...previous.drafts, [pending.actionId]: { ...draft, [field]: pending.text ?? '' } } : previous.drafts,
         };
       });
@@ -154,7 +167,7 @@ async function synchronize(): Promise<void> {
   }
 }
 
-async function enqueue(type: Operation['type'], actionId: string, extra: Partial<Operation> = {}): Promise<boolean> {
+async function enqueue(type: Operation['type'], actionId: string, extra: Partial<Operation> = {}, expectedComment?: CommentContext): Promise<boolean> {
   if (!local.memberId) { updateRuntime({ error: 'Make a community profile before sharing or joining in. Your draft stays here.' }); return false; }
   if (!local.snapshot) { updateRuntime({ error: 'Connect once to load the demo room before submitting an action.' }); return false; }
   const target = actionFor(local, actionId);
@@ -171,7 +184,20 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
   };
   updateRuntime({ busy: true, error: null });
   let duplicate = false;
+  let changedComposer = false;
   const saved = await mutate(previous => {
+    if (type === 'contribute' && expectedComment) {
+      const parentId = previous.replyTargets?.[actionId] ?? null;
+      if (previous.memberId !== expectedComment.memberId || previous.snapshot?.roomId !== expectedComment.roomId || operation.memberId !== expectedComment.memberId || operation.roomId !== expectedComment.roomId || actionId !== expectedComment.actionId || parentId !== expectedComment.parentId || draftsFor(previous, actionId).discussion !== expectedComment.text || operation.text !== expectedComment.text.trim() || (operation.parentId ?? null) !== expectedComment.parentId) {
+        changedComposer = true;
+        return previous;
+      }
+      const acknowledgement = commentStateFor(previous, expectedComment);
+      if (['pending', 'posted', 'unconfirmed'].includes(acknowledgement.kind)) {
+        duplicate = true;
+        return previous;
+      }
+    }
     const sameAuthorTransition = ['change-plan', 'cancel-plan'].includes(type) && previous.pending.some(item => ['change-plan', 'cancel-plan'].includes(item.type) && item.actionId === actionId && item.memberId === operation.memberId);
     if (sameAuthorTransition || type === 'bring-item' && previous.pending.some(item => item.type === type && item.roomId === operation.roomId && item.actionId === actionId && item.memberId === operation.memberId && item.itemIndex === operation.itemIndex)) {
       duplicate = true;
@@ -180,9 +206,9 @@ async function enqueue(type: Operation['type'], actionId: string, extra: Partial
     return { ...previous, pending: [...previous.pending, operation] };
   });
   const announceQueue = type !== 'bring-item' && (!['react', 'rsvp'].includes(type) || runtime.connectivity !== 'online');
-  updateRuntime({ busy: false, ...(saved && announceQueue ? { notice: 'Saved on this device — waiting to sync.' } : {}) });
-  if (saved) void synchronize();
-  return saved && !duplicate;
+  updateRuntime({ busy: false, ...(changedComposer ? { notice: 'Your comment or reply target changed. Nothing new was sent; review the current draft.' } : duplicate && type === 'contribute' ? { notice: 'This exact comment is already pending or posted. Its original submission is kept.' } : saved && announceQueue ? { notice: 'Saved on this device — waiting to sync.' } : {}) });
+  if (saved && !changedComposer) void synchronize();
+  return saved && !duplicate && !changedComposer;
 }
 
 function inputForDraft(draft: CreationDraft): ActionInput | null {
@@ -263,9 +289,10 @@ const actions: Actions = {
     if (!validActionId(actionId)) return;
     if (await mutate(previous => ({ ...previous, savedActionIds: (previous.savedActionIds ?? []).includes(actionId) ? previous.savedActionIds!.filter(id => id !== actionId) : [...(previous.savedActionIds ?? []), actionId] }))) updateRuntime({ notice: 'Your saved plans stay private on this device.', error: null });
   },
-  async setReplyTo(actionId, parentId) {
+  async setReplyTo(actionId, parentId, expectedNamespace) {
     if (!validActionId(actionId)) return;
-    await mutate(previous => ({ ...previous, replyTargets: { ...previous.replyTargets, [actionId]: parentId } }));
+    const namespace = expectedNamespace ?? { roomId: local.snapshot?.roomId ?? null, memberId: local.memberId };
+    await mutate(previous => (previous.snapshot?.roomId ?? null) === namespace.roomId && previous.memberId === namespace.memberId ? { ...previous, replyTargets: { ...previous.replyTargets, [actionId]: parentId } } : previous);
   },
   async getWeather(cityId, date) {
     const context = { cityId, date, sourceUrl: 'https://open-meteo.com/' };
@@ -286,10 +313,17 @@ const actions: Actions = {
       throw new Error('Unsupported forecast response.');
     } catch { return { ...context, status: 'unavailable', reason: 'A forecast could not be verified for this city and date. Try again, or include a rain backup while making your plan.' }; }
   },
-  async saveDraft(actionId, text, field = 'discussion') {
+  async saveDraft(actionId, text, field = 'discussion', expectedNamespace) {
     if (!validActionId(actionId)) return false;
     if (text.length > 2000) { updateRuntime({ error: 'Keep your contribution within 2,000 characters.' }); return false; }
-    return mutate(previous => ({ ...previous, drafts: { ...previous.drafts, [actionId]: { ...draftsFor(previous, actionId), [field]: text } } }));
+    const namespace = expectedNamespace ?? { roomId: local.snapshot?.roomId ?? null, memberId: local.memberId };
+    let changed = false;
+    const saved = await mutate(previous => {
+      if ((previous.snapshot?.roomId ?? null) !== namespace.roomId || previous.memberId !== namespace.memberId) { changed = true; return previous; }
+      return { ...previous, drafts: { ...previous.drafts, [actionId]: { ...draftsFor(previous, actionId), [field]: text } } };
+    });
+    if (changed) updateRuntime({ notice: 'The room or profile changed. This editor text was kept open and was not written into a different context.' });
+    return saved && !changed;
   },
   async saveCreationDraft(draft) {
     if (draft.change || !validActionId(draft.id) || !Object.entries(ACTION_LIMITS).every(([field, limit]) => { const value = draft[field as keyof CreationDraft]; return typeof value === 'string' && value.length <= limit; })) {
@@ -392,10 +426,20 @@ const actions: Actions = {
     if (trimmed.length < 5 || trimmed.length > 600) { updateRuntime({ error: 'Explain the cancellation in 5–600 characters. Your reason is saved here.' }); return false; }
     return enqueue('cancel-plan', actionId, { changeReason: trimmed, expectedChangeId });
   },
-  async publishContribution(actionId, text, parentId) {
+  async publishContribution(actionId, text, parentId, expectedContext) {
     const trimmed = text.trim();
     if (!trimmed || trimmed.length > 2000) { updateRuntime({ error: 'Write a question or correction of 1–2,000 characters.' }); return; }
-    await enqueue('contribute', actionId, { text: trimmed, ...(parentId ? { parentId } : {}) });
+    const context = expectedContext ?? (local.memberId && local.snapshot ? { roomId: local.snapshot.roomId, memberId: local.memberId, actionId, parentId: parentId ?? null, text } : undefined);
+    await enqueue('contribute', actionId, { text: trimmed, ...(parentId ? { parentId } : {}) }, context);
+  },
+  async startAnotherComment(request) {
+    let result: 'cleared' | 'changed' | 'unavailable' = 'unavailable';
+    const saved = await mutate(previous => {
+      const reset = resetPostedComment(previous, request);
+      result = reset.result;
+      return reset.state;
+    });
+    return saved ? result : 'failed';
   },
   async castVote(actionId, choice: Choice) { await enqueue('vote', actionId, { choice }); },
   async closeVote(actionId) { await enqueue('close', actionId); },

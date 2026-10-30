@@ -1632,6 +1632,305 @@ async function verifyLearnServe() {
   } finally { await readerContext.close(); await authorContext.close(); }
 }
 
+async function captureComments(page, state, locator) {
+  const original = page.viewportSize();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await locator.evaluate(element => element.scrollIntoView({ block: 'start', inline: 'nearest' }));
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  const box = await locator.boundingBox();
+  assert.ok(box && box.y > -2 && box.y < 844, `${state} comment evidence is visible in the original viewport`);
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'comment acknowledgement fits the narrow viewport');
+  await page.screenshot({ path: `/tmp/zaction-comment-${state}-390x844.png`, fullPage: false });
+  await page.setViewportSize(original);
+}
+
+async function verifyCommentAcknowledgement() {
+  const authorContext = await newContext({ viewport: { width: 390, height: 844 } });
+  const readerContext = await newContext({ viewport: { width: 1440, height: 1100 } });
+  await mockWeather(authorContext);
+  await mockWeather(readerContext);
+  let releaseDelayed;
+  try {
+    const author = await openPage(authorContext);
+    const reader = await openPage(readerContext);
+    await onboard(author, 'Mina', ['help']);
+    await onboard(reader, 'Noel', ['help']);
+    const authorId = (await local(author)).memberId;
+    const readerId = (await local(reader)).memberId;
+    const first = await fillPlan(author, 'bbq', 'Comment review · courtyard gathering', '0', []);
+    await author.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === first) && !(await local(author)).pending.length, 'first comment plan is accepted');
+    const second = await fillPlan(author, 'potluck', 'Comment review · library supper', '0', []);
+    await author.getByTestId('publish-action').click();
+    await eventually(async () => (await snapshot()).actions.some(action => action.id === second) && !(await local(author)).pending.length, 'independent comment plan is accepted');
+    await foreground(reader);
+    await eventually(async () => (await local(reader)).snapshot.actions.some(action => action.id === second), 'other real profile sees both plans');
+    const input = (page, parentId) => page.getByTestId(parentId ? `reply-input-${parentId}` : 'contribution-input');
+    const submit = (page, parentId) => page.getByTestId(parentId ? `reply-submit-${parentId}` : 'publish-contribution');
+    const status = (page, parentId) => page.getByTestId(parentId ? `reply-status-${parentId}` : 'comment-status');
+    const write = async (page, actionId, text, parentId) => {
+      await input(page, parentId).fill(text);
+      await eventually(async () => (await local(page)).drafts[actionId]?.discussion === text && ((await local(page)).replyTargets?.[actionId] ?? null) === (parentId ?? null), 'exact raw comment and reply target durably saved before sharing');
+    };
+    const expectState = async (page, kind, parentId) => eventually(async () => await status(page, parentId).getAttribute('data-comment-state') === kind, `exact composer is ${kind}`);
+    const comments = async id => target(await snapshot(), id).contributions;
+    const untouched = room => room.actions.map(action => ({ id: action.id, ballots: action.ballots, rsvps: action.rsvps, reactions: action.reactions, bringClaims: action.bringClaims, minutes: action.minutes, completedTasks: action.completedTasks, outcome: action.outcome }));
+    const before = await snapshot();
+    const authorProgress = (await local(author)).progress;
+    const readerProgress = (await local(reader)).progress;
+    const otherDraft = 'Keep this separate supper question and its decision notes.';
+    await select(author, second);
+    await write(author, second, otherDraft);
+    const secondDraft = structuredClone((await local(author)).drafts[second]);
+    await select(author, first);
+    const raw = '  I can check the accessible courtyard entrance before we agree on the meeting point.  ';
+    await write(author, first, raw);
+    const duplicateTab = await openPage(authorContext);
+    await select(duplicateTab, first);
+    await eventually(async () => await input(duplicateTab).inputValue() === raw, 'second tab sees the exact same saved composer');
+    await write(duplicateTab, first, `${raw} `);
+    await write(duplicateTab, first, raw); // Exercise a real saved React editor cache.
+    await authorContext.setOffline(true);
+    await Promise.all([author, duplicateTab].map(page => submit(page).evaluate(button => button.click())));
+    await eventually(async () => (await local(author)).pending.filter(operation => operation.type === 'contribute' && operation.actionId === first).length === 1, 'simultaneous tabs queue one exact comment intent');
+    const pending = (await local(author)).pending.find(operation => operation.type === 'contribute' && operation.actionId === first);
+    assert.equal(pending.memberId, authorId);
+    assert.equal(pending.text, raw.trim());
+    await expectState(duplicateTab, 'pending');
+    // This background tab misses the accepted receipt and subsequent reset.
+    // On resuming it must invalidate a pristine cache bound to pending work,
+    // rather than require that it happened to observe the intermediate post.
+    await duplicateTab.route('**/api/state', route => route.abort('failed'));
+    await expectState(author, 'pending');
+    assert.equal(await submit(author).isDisabled(), true);
+    assert.equal(await input(author).getAttribute('readonly'), null, 'new typing remains possible while the old comment is pending');
+    const reload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(reload.fromServiceWorker());
+    await expectState(author, 'pending');
+    assert.equal((await local(author)).pending.find(operation => operation.id === pending.id).text, raw.trim());
+    assert.equal((await comments(first)).length, 0);
+    await captureComments(author, 'pending', author.locator('.comment-composer'));
+    const attempts = [];
+    let dropResponse = true;
+    await authorContext.route('**/api/operations', async route => {
+      const operation = route.request().postDataJSON();
+      if (operation.id !== pending.id) return route.continue();
+      attempts.push(operation.id);
+      if (!dropResponse) return route.continue();
+      await route.fetch(); // The real server accepts; this response alone is lost.
+      await route.abort('failed');
+    });
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await eventually(async () => (await comments(first)).some(comment => comment.id === pending.id) && (await local(author)).pending.some(operation => operation.id === pending.id), 'a real accepted comment with a lost response remains locally pending');
+    await expectState(author, 'pending');
+    assert.match(await status(author).innerText(), /confirmation/i);
+    assert.doesNotMatch(await status(author).innerText(), /not posted yet|waiting to post/i, 'pending acknowledgement cannot deny a comment that the real server already accepted');
+    await captureComments(author, 'receipt-pending', author.locator('.comment-composer'));
+    await authorContext.setOffline(true);
+    const lostReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(lostReload.fromServiceWorker());
+    await expectState(author, 'pending');
+    dropResponse = false;
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await eventually(async () => !(await local(author)).pending.length && (await local(author)).receipts.some(receipt => receipt.id === pending.id && receipt.accepted), 'stable replay recovers the original receipt');
+    await authorContext.unroute('**/api/operations');
+    await expectState(author, 'posted');
+    assert.ok(attempts.length >= 2 && attempts.every(id => id === pending.id));
+    assert.equal((await comments(first)).filter(comment => comment.id === pending.id).length, 1);
+    assert.equal(await input(author).inputValue(), raw, 'acceptance retains the exact raw private text');
+    assert.equal(await input(author).getAttribute('readonly'), '');
+    assert.equal(await submit(author).isDisabled(), true);
+    await captureComments(author, 'posted', author.locator('.comment-composer'));
+    await author.setViewportSize({ width: 1440, height: 1100 });
+    await author.locator('.comment-composer').evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await author.screenshot({ path: '/tmp/zaction-comment-posted-desktop.png', fullPage: false });
+    await author.setViewportSize({ width: 390, height: 844 });
+    const postedTab = duplicateTab;
+    await expectState(postedTab, 'pending');
+    assert.equal(await input(postedTab).inputValue(), raw, 'the background tab still has a saved pending cache and missed the posted state');
+    await author.getByTestId('start-another-comment').focus();
+    await author.keyboard.press('Enter');
+    await eventually(async () => (await local(author)).drafts[first].discussion === '' && (await local(author)).receipts.find(receipt => receipt.id === pending.id).composerReset === true, 'explicit next comment commits the reset marker and clears only this composer');
+    await eventually(async () => input(author).evaluate(element => element === document.activeElement), 'explicit reset focuses the committed empty composer');
+    await captureComments(author, 'after-reset', author.locator('.comment-composer'));
+    await postedTab.unroute('**/api/state');
+    await foreground(postedTab);
+    await eventually(async () => await input(postedTab).inputValue() === '', 'another tab invalidates pristine posted text after the committed reset');
+    assert.equal(await submit(postedTab).isDisabled(), true);
+    await submit(postedTab).evaluate(button => button.click());
+    assert.equal((await local(postedTab)).pending.filter(operation => operation.type === 'contribute' && operation.actionId === first).length, 0, 'old cached text cannot be flushed into a new comment without new typing');
+    assert.equal((await comments(first)).length, 1);
+    await captureComments(postedTab, 'cross-tab-reset', postedTab.locator('.comment-composer'));
+    await postedTab.close();
+    assert.deepEqual((await local(author)).drafts[second], secondDraft);
+    assert.equal((await comments(first))[0].id, pending.id);
+    const afterReset = await local(author);
+    const handledReceipt = afterReset.receipts.find(receipt => receipt.id === pending.id);
+    // A previously persisted operation can be replayed after a deliberate reset.
+    // Its stable server receipt must preserve the existing private reset marker.
+    await saveBrowserRecord(author, { ...afterReset, pending: [...afterReset.pending, pending] });
+    await author.reload({ waitUntil: 'networkidle' });
+    await eventually(async () => !(await local(author)).pending.length, 'an old exact operation replay finishes after deliberate reset');
+    assert.deepEqual((await local(author)).receipts.find(receipt => receipt.id === pending.id), handledReceipt);
+    assert.equal((await local(author)).drafts[first].discussion, '');
+    await write(author, first, raw);
+    await expectState(author, 'ready');
+    await submit(author).click();
+    await eventually(async () => (await comments(first)).filter(comment => comment.text === raw.trim()).length === 2 && !(await local(author)).pending.length, 'identical words after deliberate reset are a new intentional comment');
+    await expectState(author, 'posted');
+    const repeated = (await comments(first)).find(comment => comment.id !== pending.id && comment.text === raw.trim());
+    assert.notEqual(repeated.id, pending.id);
+    assert.equal((await local(author)).receipts.find(receipt => receipt.id === pending.id).composerReset, true);
+    assert.equal((await comments(second)).length, 0);
+    pass('exact comment acknowledgement survives offline worker reload and lost-response replay; simultaneous tabs share one intent and deliberate reset permits a same-text new operation');
+
+    await author.getByTestId('start-another-comment').click();
+    await eventually(async () => (await local(author)).drafts[first].discussion === '', 'second deliberate reset is durable');
+    await select(reader, first);
+    const readerText = 'Please also check a quiet seating option before the gathering.';
+    await write(reader, first, readerText);
+    await submit(reader).click();
+    await eventually(async () => (await comments(first)).some(comment => comment.memberId === readerId && comment.text === readerText) && !(await local(reader)).pending.length, 'another real profile adds a different reply destination');
+    const readerParent = (await comments(first)).find(comment => comment.memberId === readerId && comment.text === readerText);
+    await foreground(author);
+    await eventually(async () => target((await local(author)).snapshot, first).contributions.some(comment => comment.id === readerParent.id), 'both reply parents are available to the author');
+    await author.getByTestId(`reply-open-${pending.id}`).click();
+    const submittedReply = 'I will check this entrance and share what I find.';
+    await write(author, first, submittedReply, pending.id);
+    let delayedId;
+    const delayed = new Promise(resolve => { releaseDelayed = resolve; });
+    await authorContext.route('**/api/operations', async route => {
+      const operation = route.request().postDataJSON();
+      if (operation.type !== 'contribute' || operation.text !== submittedReply) return route.continue();
+      delayedId = operation.id;
+      await delayed;
+      await route.continue();
+    });
+    await submit(author, pending.id).click();
+    await eventually(async () => Boolean(delayedId && (await local(author)).pending.some(operation => operation.id === delayedId)), 'original reply is durably pending before delayed acceptance');
+    await expectState(author, 'pending', pending.id);
+    await author.getByTestId(`reply-open-${readerParent.id}`).click();
+    const newer = 'A newer private reply about quiet seating must remain directed to Noel.';
+    await write(author, first, newer, readerParent.id);
+    await expectState(author, 'ready', readerParent.id);
+    assert.equal(await submit(author, readerParent.id).isEnabled(), true, 'a different saved draft is not blocked by the earlier exact pending reply');
+    await input(author, readerParent.id).focus();
+    releaseDelayed();
+    await eventually(async () => (await local(author)).receipts.some(receipt => receipt.id === delayedId && receipt.accepted), 'delayed original reply is accepted');
+    await authorContext.unroute('**/api/operations');
+    const acceptedReply = (await comments(first)).find(comment => comment.id === delayedId);
+    assert.equal(acceptedReply.parentId, pending.id);
+    assert.equal(acceptedReply.text, submittedReply);
+    assert.equal((await local(author)).replyTargets[first], readerParent.id);
+    assert.equal((await local(author)).drafts[first].discussion, newer);
+    assert.equal(await input(author, readerParent.id).inputValue(), newer);
+    assert.equal(await input(author, readerParent.id).getAttribute('readonly'), null);
+    assert.ok(await input(author, readerParent.id).evaluate(element => element === document.activeElement), 'late acknowledgement does not move focus from a newer reply');
+    await captureComments(author, 'newer-reply', author.locator('.reply-form'));
+    await submit(author, readerParent.id).click();
+    await eventually(async () => (await comments(first)).some(comment => comment.text === newer && comment.parentId === readerParent.id) && !(await local(author)).pending.length, 'reviewed newer reply posts only to its new parent');
+    await expectState(author, 'posted', readerParent.id);
+    assert.deepEqual((await local(author)).drafts[second], secondDraft);
+    pass('late acceptance acknowledges only the submitted reply; newer raw text, a changed parent, focus and another plan’s draft remain intact');
+
+    const postedState = await local(author);
+    const postedReceipt = postedState.receipts.find(receipt => receipt.operation?.text === newer);
+    await authorContext.setOffline(true);
+    const withoutConfirmedComment = structuredClone(postedState);
+    target(withoutConfirmedComment.snapshot, first).contributions = target(withoutConfirmedComment.snapshot, first).contributions.filter(comment => comment.id !== postedReceipt.id);
+    await saveBrowserRecord(author, withoutConfirmedComment);
+    const unconfirmedReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(unconfirmedReload.fromServiceWorker());
+    await expectState(author, 'unconfirmed', readerParent.id);
+    assert.equal(await input(author, readerParent.id).inputValue(), newer);
+    assert.equal(await submit(author, readerParent.id).isDisabled(), true, 'a receipt without its same-ID accepted comment cannot be posted again or treated as a confirmed reset');
+    await captureComments(author, 'unconfirmed', author.locator('.reply-form'));
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await expectState(author, 'posted', readerParent.id);
+    await authorContext.setOffline(true);
+    await author.evaluate(() => {
+      const original = IDBObjectStore.prototype.put;
+      window.__restoreCommentPut = () => { IDBObjectStore.prototype.put = original; };
+      IDBObjectStore.prototype.put = function () { throw new DOMException('Controlled comment reset quota failure', 'QuotaExceededError'); };
+    });
+    try {
+      await author.getByTestId('start-another-comment').click();
+      await author.getByTestId('comment-reset-status').filter({ hasText: /could not|failed|kept|not cleared/i }).waitFor();
+      assert.equal(await input(author, readerParent.id).inputValue(), newer);
+      assert.equal((await local(author)).drafts[first].discussion, newer);
+      assert.notEqual((await local(author)).receipts.find(receipt => receipt.id === postedReceipt.id).composerReset, true);
+      await captureComments(author, 'reset-failed', author.locator('.reply-form'));
+    } finally { await author.evaluate(() => window.__restoreCommentPut()); }
+    // A second writer changes durable work before the stale tab's reset runs.
+    // The real controller must compare the fresh IDB record rather than erase it.
+    const changedRaw = 'Keep this newer raw draft, including its changed root destination.  ';
+    const changed = await local(author);
+    await saveBrowserRecord(author, { ...changed, drafts: { ...changed.drafts, [first]: { ...changed.drafts[first], discussion: changedRaw } }, replyTargets: { ...changed.replyTargets, [first]: null } });
+    await author.getByTestId('start-another-comment').click();
+    await eventually(async () => /changed|kept|review|not cleared/i.test(await author.getByTestId('comment-reset-status').innerText()), 'stale reset reports changed work rather than a successful clear');
+    assert.equal((await local(author)).drafts[first].discussion, changedRaw);
+    assert.equal((await local(author)).replyTargets[first], null);
+    assert.notEqual((await local(author)).receipts.find(receipt => receipt.id === postedReceipt.id).composerReset, true);
+    const missingText = 'Keep this reply even if its original parent is unavailable.';
+    const missing = await local(author);
+    await saveBrowserRecord(author, { ...missing, drafts: { ...missing.drafts, [first]: { ...missing.drafts[first], discussion: missingText } }, replyTargets: { ...missing.replyTargets, [first]: 'unavailable-comment-parent' } });
+    const missingReload = await author.reload({ waitUntil: 'domcontentloaded' });
+    assert.ok(missingReload.fromServiceWorker());
+    await author.getByTestId('reply-target-unavailable').waitFor();
+    assert.equal((await local(author)).drafts[first].discussion, missingText);
+    const missingParentSubmit = author.getByTestId('publish-contribution');
+    assert.ok(!await missingParentSubmit.count() || await missingParentSubmit.isDisabled(), 'an unavailable parent is never silently converted into a root post');
+    await author.getByTestId('recover-reply-target').click();
+    await eventually(async () => (await local(author)).replyTargets[first] === null && (await local(author)).drafts[first].discussion === missingText, 'explicit missing-parent recovery changes only the destination');
+    await authorContext.setOffline(false);
+    await foreground(author);
+    await select(reader, second);
+    const rejectedText = 'Retain this original request when the organizer withdraws this plan.';
+    await readerContext.setOffline(true);
+    await write(reader, second, rejectedText);
+    await submit(reader).click();
+    await eventually(async () => (await local(reader)).pending.some(operation => operation.type === 'contribute' && operation.actionId === second && operation.text === rejectedText), 'late comment is durably queued against its original plan');
+    const rejectedOperation = (await local(reader)).pending.find(operation => operation.type === 'contribute' && operation.actionId === second);
+    await write(reader, second, '');
+    await select(author, second);
+    await author.getByTestId(`plan-cancel-${second}`).click();
+    await author.getByTestId('cancel-reason').fill('The library space is unavailable. Keep the original discussion and its history.');
+    await author.getByTestId('confirm-cancel').click();
+    await eventually(async () => target(await snapshot(), second).lifecycle.status === 'cancelled' && !(await local(author)).pending.length, 'organizer really withdraws only the other plan');
+    await readerContext.setOffline(false);
+    await foreground(reader);
+    await eventually(async () => (await local(reader)).receipts.some(receipt => receipt.id === rejectedOperation.id && !receipt.accepted) && !(await local(reader)).pending.length, 'server rejection retains the original offline request');
+    assert.equal((await local(reader)).drafts[second].discussion, '', 'a late rejection cannot refill an intentionally cleared composer');
+    const rejectedReceipt = (await local(reader)).receipts.find(receipt => receipt.id === rejectedOperation.id);
+    assert.deepEqual(rejectedReceipt.operation, rejectedOperation);
+    assert.equal((await comments(second)).length, 0);
+    await reader.reload({ waitUntil: 'networkidle' });
+    assert.equal((await local(reader)).drafts[second].discussion, '');
+    await select(reader, second, 'proposal');
+    await reader.locator('[data-submission-status="rejected"]').filter({ hasText: rejectedText }).getByTestId('recover-submission').click();
+    await eventually(async () => (await local(reader)).drafts[second].discussion === rejectedText, 'history recovery explicitly restores the original rejected text');
+    assert.equal(await input(reader).inputValue(), rejectedText);
+    assert.equal(await input(reader).getAttribute('readonly'), '', 'restored historical work is not silently sent to a replacement');
+    await captureComments(reader, 'rejected-recovery', reader.locator('.comment-composer'));
+    await reader.setViewportSize({ width: 1440, height: 1100 });
+    await reader.locator('.comment-composer').evaluate(element => element.scrollIntoView({ block: 'start' }));
+    await reader.screenshot({ path: '/tmp/zaction-comment-rejected-recovery-desktop.png', fullPage: false });
+    assert.equal((await local(author)).drafts[first].discussion, missingText);
+    assert.deepEqual(untouched(await snapshot()), untouched(before), 'comments and composer resets never change votes, RSVPs, reactions, help, minutes, tasks or outcomes');
+    assert.deepEqual((await local(author)).progress, authorProgress);
+    assert.deepEqual((await local(reader)).progress, readerProgress);
+    assert.deepEqual(pageErrors, []);
+    pass('quota and stale-reset conflicts preserve newer work; unavailable reply targets need explicit recovery and late terminal rejections retain original history without refilling a cleared editor');
+  } finally {
+    releaseDelayed?.();
+    await readerContext.close();
+    await authorContext.close();
+  }
+}
+
 try {
   await eventually(async () => {
     if (child.exitCode !== null) throw new Error(`Server exited: ${output}`);
@@ -1646,6 +1945,9 @@ try {
   } else if (process.env.ZACTION_E2E_SCOPE === 'learn') {
     await verifyLearnServe();
     console.log(`Completed ${passed} focused Learn/Serve production browser checks.`);
+  } else if (process.env.ZACTION_E2E_SCOPE === 'comment') {
+    await verifyCommentAcknowledgement();
+    console.log(`Completed ${passed} focused comment acknowledgement production browser checks.`);
   } else {
   const mayaContext = await newContext({ viewport: { width: 390, height: 844 } });
   const noahContext = await newContext({ viewport: { width: 1440, height: 1100 } });
@@ -1942,6 +2244,8 @@ try {
 
   await select(maya, actionA);
   const authText = 'Retain this comment while the test transport rejects its authorization.';
+  await maya.getByTestId('start-another-comment').click();
+  await eventually(async () => (await local(maya)).drafts[actionA]?.discussion === '', 'an intentional new authorization-test comment starts after the earlier posted question');
   let interceptedId;
   await mayaContext.route('**/api/operations', async route => {
     const op = route.request().postDataJSON();
@@ -1969,6 +2273,9 @@ try {
   pass('a controlled authorization rejection preserves the original submission across reload and explicit recovery publishes one copy to its original plan');
 
   const unsaved = 'Keep this question visible if the local browser cannot save it.';
+  await eventually(async () => await maya.getByTestId('comment-status').getAttribute('data-comment-state') === 'posted', 'recovered comment is acknowledged before starting another draft');
+  await maya.getByTestId('start-another-comment').click();
+  await eventually(async () => (await local(maya)).drafts[actionA]?.discussion === '', 'quota-test draft starts through the explicit next-comment control');
   await maya.evaluate(() => {
     const original = IDBObjectStore.prototype.put;
     window.__restoreZactionPut = () => { IDBObjectStore.prototype.put = original; };
@@ -2031,6 +2338,7 @@ try {
   await verifyScheduleWeather(maya);
   await verifyHelpHandoff();
   await verifyLearnServe();
+  await verifyCommentAcknowledgement();
 
   if (process.env.ZACTION_CAPTURE_LIVE_WEATHER === '1') {
     // This context has no weather routes. Its observed provider result is kept

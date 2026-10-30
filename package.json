@@ -1,6 +1,6 @@
 {
   "name": "zaction",
-  "version": "0.1.0-preview.10",
+  "version": "0.1.0-preview.11",
   "private": true,
   "type": "module",
   "description": "A local-first civic action PWA: small actions, shared power.",

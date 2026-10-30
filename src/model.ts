@@ -1,4 +1,5 @@
 import type { SourceRef } from '../civic-sources.mjs';
+import type { CommentContext, ResetCommentRequest } from './comments';
 export type { SourceRef } from '../civic-sources.mjs';
 export type MemberId = string;
 export type Choice = 'approve' | 'oppose' | 'abstain';
@@ -131,6 +132,9 @@ export interface Operation {
   changeReason?: string;
 }
 export interface Receipt { id: string; actionId: string; accepted: boolean; reason: string; receivedAt: string; type: Operation['type']; operation?: Operation }
+// Private composer acknowledgement on an existing local receipt wrapper.
+// Never sent to the server or used as an operation/receipt fact.
+export interface LocalReceipt extends Receipt { composerReset?: true }
 export interface ActionDrafts { discussion: string; minutes: string }
 export interface PersonalProgress { read: boolean; reviewed: boolean }
 export interface LocalState {
@@ -142,7 +146,7 @@ export interface LocalState {
   progress: Record<string, PersonalProgress>;
   creationDraft: CreationDraft;
   pending: Operation[];
-  receipts: Receipt[];
+  receipts: LocalReceipt[];
   lastSync: string | null;
   identityFingerprint: string;
   community?: CommunityPreferences;
@@ -170,7 +174,7 @@ export interface Actions {
   navigate(view: View): void;
   selectAction(id: string, view?: View): Promise<void>;
   join(memberId: MemberId): Promise<void>;
-  saveDraft(actionId: string, text: string, field?: keyof ActionDrafts): Promise<boolean>;
+  saveDraft(actionId: string, text: string, field?: keyof ActionDrafts, expectedNamespace?: { roomId: string | null; memberId: string | null }): Promise<boolean>;
   saveCreationDraft(draft: CreationDraft): Promise<boolean>;
   newAction(kind?: GatheringKind): Promise<void>;
   startSourceDiscussion(sourceRef: SourceRef): Promise<'opened' | 'conflict' | 'failed'>;
@@ -181,8 +185,9 @@ export interface Actions {
   reviewPlanChangeDraft(actionId: string): Promise<boolean>;
   saveCancelDraft(actionId: string, reason: string): Promise<boolean>;
   cancelPlan(actionId: string, reason: string, expectedChangeId: string | null): Promise<boolean>;
-  publishContribution(actionId: string, text: string, parentId?: string): Promise<void>;
-  setReplyTo(actionId: string, parentId: string | null): Promise<void>;
+  publishContribution(actionId: string, text: string, parentId?: string, expectedContext?: CommentContext): Promise<void>;
+  startAnotherComment(request: ResetCommentRequest): Promise<'cleared' | 'changed' | 'unavailable' | 'failed'>;
+  setReplyTo(actionId: string, parentId: string | null, expectedNamespace?: { roomId: string | null; memberId: string | null }): Promise<void>;
   finishOnboarding(profile: OnboardingInput): Promise<boolean>;
   browseCommunity(): Promise<void>;
   savePreferences(preferences: Partial<OnboardingInput>): Promise<boolean>;

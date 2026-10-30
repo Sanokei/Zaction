@@ -52,6 +52,14 @@ Offline author drafts and operations retain their original target, lifecycle tok
 
 Superseded/cancelled plans reject new participation against their original IDs instead of silently moving it to the successor. The exact owner may still release the exact current bring-item claim on that original inactive plan. A release does not move the offer to a fresh plan or establish delivery. These controls use existing pseudonymous preview ownership, not new production authentication, group authority, notifications, payment, or location tracking.
 
+## Comment acknowledgement and local receipt metadata
+
+Comment status derives from the exact existing room/profile/action/reply target, submitted text, operation ID and receipt. A posted acknowledgement also requires the same-ID accepted contribution; identical wording on another post is not proof of acceptance. Matching pending/posted requests are guarded in the atomic browser enqueue, while different text or reply targets remain editable. Late receipts never automatically clear a composer.
+
+A deliberate **Start another comment** clears only a freshly matched raw durable discussion draft and its matching reply target after the accepted operation/receipt/contribution and absence of a matching pending request are checked. Changed text/targets, unavailable records and save failures leave work intact. The UI additionally checks its captured editor version before clearing or moving focus, so typing during the durable reset wins. Missing reply targets require explicit recovery, not silent root posting. Other action drafts, minutes and original submission history are preserved.
+
+The only local shape extension is optional private `composerReset: true` on an existing local receipt wrapper. It records a successfully handled deliberate reset so retyping identical words after reload is a new intent. It is not a new ledger, collection, schema version, server receipt/operation field, migration or backfill. Missing markers remain missing; stable replay preserves locally owned markers and never trusts a marker supplied remotely. Original operation text and receipt ID/reason/time/acceptance remain unchanged. Existing private browser data and sessions remain outside release ZIPs. This increment changes no server protocol, source catalog, vote, RSVP, progress or external messaging behavior.
+
 ## Discussion and gathering wording
 
 Lifecycle wording follows the explicit original record: `planning.kind: idea` is a discussion, other known kinds are gatherings, and absent/unknown kinds use neutral plan/listing language. A source citation, title, route, or default empty form cannot reclassify a saved record. Pending creation/change descriptions use their exact payload; withdrawal and historical descriptions use the immutable original target. An explicitly different successor type never relabels its original.
