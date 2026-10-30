@@ -52,6 +52,12 @@ Offline author drafts and operations retain their original target, lifecycle tok
 
 Superseded/cancelled plans reject new participation against their original IDs instead of silently moving it to the successor. The exact owner may still release the exact current bring-item claim on that original inactive plan. A release does not move the offer to a fresh plan or establish delivery. These controls use existing pseudonymous preview ownership, not new production authentication, group authority, notifications, payment, or location tracking.
 
+## Discussion and gathering wording
+
+Lifecycle wording follows the explicit original record: `planning.kind: idea` is a discussion, other known kinds are gatherings, and absent/unknown kinds use neutral plan/listing language. A source citation, title, route, or default empty form cannot reclassify a saved record. Pending creation/change descriptions use their exact payload; withdrawal and historical descriptions use the immutable original target. An explicitly different successor type never relabels its original.
+
+This is a presentation correction: no schema, migration, server protocol, ledger, lifecycle token, operation ID, or stored text is changed. Existing ballots, bring offers, RSVPs and source references remain intact; discussion wording does not hide planning fields or item/task intentions. Withdrawing a discussion affects only its Zaction listing, preserves the group result/history, and sends no notification or cancellation to an outside organization. The `civic-sources.mjs` runtime and dated source observations remain unchanged.
+
 ## Dated Learn & serve sources
 
 Keep `civic-sources.mjs` beside `server.mjs` in the extracted runtime: the server imports it, and the client bundles the same append-only curated catalog. This release adds one NYC Mesh outreach/design note for New York City. NYC Mesh is a community-network organization, not government or an election authority. The exact publisher-maintained [guide snapshot](https://github.com/nycmeshnet/nycmesh.net/blob/d53de89ba20682d348cc0d4271e64e9875985dcf/content/volunteer/index.md) returned HTTP 200 at `2026-10-29T23:12:57.514461Z`, body SHA-256 `6760307447a464cf5e6aa4f9b0d9ae82fdf72c5fd99bed2733fa83e8cea10403`. The separate canonical website check at `2026-10-29T23:13:25.939411Z` failed with proxy CONNECT 403; a successful source-snapshot read does not establish live-site access. See the [source and scope record](learn-serve-increment.md).

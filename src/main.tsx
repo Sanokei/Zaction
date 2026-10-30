@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App';
 import '@fontsource-variable/bricolage-grotesque';
 import './styles.css';
-import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, lifecycleFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
+import { MEMBERS, ACTION_LIMITS, CITY_OPTIONS, KIND_OPTIONS, contentKindFor, communityFor, emptyActionInput, emptyPlanning, actionFor, draftsFor, progressFor, lifecycleFor, type ActionInput, type Actions, type AppState, type Choice, type CityId, type CreationDraft, type DemoSnapshot, type GatheringKind, type LocalState, type Operation, type Receipt, type View } from './model';
 import { emptyLocal, loadLocal, loadCommunitySession, updateLocal, type SessionChange } from './store';
 import { parseSnapshot, validActionId, validChangeContext } from './migrations';
 import { sourceFor, validSourceRefShape } from '../civic-sources.mjs';
@@ -96,6 +96,18 @@ const acceptedMessages: Record<Operation['type'], string> = {
   'cancel-plan': 'Your gathering is marked cancelled. The original group decision remains recorded.',
 };
 
+function acceptedMessage(operation: Operation, snapshot: DemoSnapshot) {
+  const target = operation.type === 'create-action' || operation.type === 'change-plan' ? operation.action : snapshot.actions.find(action => action.id === operation.actionId);
+  const kind = contentKindFor(target);
+  if (kind === 'discussion') {
+    if (operation.type === 'create-action') return 'Your discussion is shared. Let’s see what people think.';
+    if (operation.type === 'change-plan') return 'The updated discussion is shared. Everyone can review and choose again.';
+    if (operation.type === 'cancel-plan') return 'Your discussion is withdrawn. Its original group decision and history remain recorded.';
+  }
+  if (kind === 'plan' && operation.type === 'cancel-plan') return 'Your listing is withdrawn. Its original group decision and history remain recorded.';
+  return acceptedMessages[operation.type];
+}
+
 function templateDraft(cityId: CityId, kind?: GatheringKind): CreationDraft {
   const blank = { id: crypto.randomUUID(), ...emptyActionInput(), planning: emptyPlanning(cityId, kind ?? 'idea') };
   if (!kind) return blank;
@@ -132,7 +144,7 @@ async function synchronize(): Promise<void> {
       });
       if (!saved) break;
       // Bring-item feedback stays beside the affected slot, including conflicts.
-      updateRuntime(receipt.accepted ? (['react', 'rsvp', 'bring-item'].includes(pending.type) ? { error: null } : { notice: acceptedMessages[pending.type], error: null }) : pending.type === 'bring-item' ? { notice: null } : { error: `Not accepted: ${receipt.reason}. Your original submission is kept in its history.`, notice: null });
+      updateRuntime(receipt.accepted ? (['react', 'rsvp', 'bring-item'].includes(pending.type) ? { error: null } : { notice: acceptedMessage(pending, nextSnapshot), error: null }) : pending.type === 'bring-item' ? { notice: null } : { error: `Not accepted: ${receipt.reason}. Your original submission is kept in its history.`, notice: null });
     }
   } catch {
     updateRuntime({ connectivity: navigator.onLine ? 'unavailable' : 'offline' });

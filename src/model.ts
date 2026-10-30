@@ -33,6 +33,13 @@ export const KIND_OPTIONS = [
   { id: 'idea', name: 'Good conversations', emoji: '💬' },
 ] as const;
 export type GatheringKind = typeof KIND_OPTIONS[number]['id'];
+// A presentation boundary from the authored record, never from its citation,
+// title, current route, lifecycle relationship, or a form's default planning.
+export function contentKindFor(input?: { planning?: { kind?: string } }): 'discussion' | 'gathering' | 'plan' {
+  const kind = input?.planning?.kind;
+  if (kind === 'idea') return 'discussion';
+  return KIND_OPTIONS.some(option => option.id === kind) ? 'gathering' : 'plan';
+}
 export interface Planning {
   kind: GatheringKind;
   date: string;
